@@ -1,27 +1,11 @@
-"""单文件运动想象 BCI 命令行程序（Python 3.10+，真实 EEG / LSL）。
-
-查看使用说明：  python main.py
-查看设备流：    python main.py inspect-lsl
-生成设备配置：  python main.py configure-lsl --help
-个人校准采集：  python main.py record --help
-导入个人采集：  python main.py import-session --help
-训练个人模型：  python main.py train calibration.npz --model <新模型目录>
-在线解码记录：  python main.py live --model <个人模型目录> --subject <受试者ID> --eeg-name <原始EEG流名> --output <新目录>
-真实在线评分：  python main.py evaluate-live --help
-个人数据回放：  python main.py replay personal_test.npz --model <个人模型目录> --output <新目录> --realtime
-
-依赖安装：      python -m pip install -r requirements.lock.txt
-pylsl 还需要当前系统可加载的 liblsl 库。
-
-真实设备流程：确认原始 EEG 流、通道位置、单位和参考电极 → 采集本人校准数据
-（至少两组左右手试次）→ 导入并训练 → 使用冻结模型进行独立在线测试。
-record/live 需要外部实验程序提供独立的 LSL 阶段标记流（默认 MI_Markers）；
-标记为单通道 JSON 字符串，只含 kind 和 trial_id，不含左右手类别。
-外部程序还须保存独立标签 JSONL，供 import-session / evaluate-live 使用。
-experiment 子命令提供可重复终端提示和独立标签日志；不含图形界面。
-无参数运行仅显示帮助，不会生成数据、训练模型或启动采集。
-"""
-
+# 真实 EEG 运动想象命令行系统：采集、校准训练、连续回放与在线解码。
+# 主要流程：inspect-lsl → configure-lsl → preflight → experiment + record
+#           → import-session → train → experiment + live → evaluate-live。
+# experiment 提供终端提示；阶段标记经 LSL 传输，左右手真值单独保存到标签日志。
+# 程序内部统一使用伏特（V），EEG 数组按“通道 × 采样点”排列。
+# T 会话用于校准训练，E 会话用于独立测试；在线解码器只接收不含类别的阶段标记。
+# 运行 python main.py 查看帮助；各子命令的参数可用 --help 查看。
+#
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
@@ -61,31 +45,32 @@ from sklearn.pipeline import Pipeline
 __version__ = "0.3.0"
 
 
-# ========================================================================
-# 01. 参数配置
-# ========================================================================
 
+# ========================================================================
+# 01. 参数配置与输入校验
+# ========================================================================
 @dataclass(frozen=True)
 class Config:
-    sfreq: float
-    channels: tuple[str, ...]
-    reference: str
-    unit: str = "V"
-    low_hz: float = 8.0
-    high_hz: float = 30.0
+    # 设备信息、滤波参数、窗口时序和质量门限集中保存在不可变配置中。
+    sfreq: float  # 实际采样率，单位 Hz
+    channels: tuple[str, ...]  # 模型使用的电极名称及固定顺序
+    reference: str  # 实际参考电极说明；此字段不执行重参考
+    unit: str = "V"  # 核心处理流程固定使用 V
+    low_hz: float = 8.0  # 带通滤波下限
+    high_hz: float = 30.0  # 带通滤波上限，必须低于奈奎斯特频率
     filter_order: int = 4
-    warmup_seconds: float = 1.0
-    window_seconds: float = 2.0
-    step_seconds: float = 0.2
-    cue_offset_seconds: float = 0.5
-    imagery_seconds: float = 4.0
-    buffer_seconds: float = 10.0
-    chunk_samples: int = 25
-    n_components: int = 4
-    threshold: float = 0.70
-    confirmations: int = 3
-    max_abs_volts: float = 500e-6
-    flat_std_volts: float = 1e-9
+    warmup_seconds: float = 1.0  # 滤波状态重置后暂不用于推断的时长
+    window_seconds: float = 2.0  # 每次模型推断使用的 EEG 窗口长度
+    step_seconds: float = 0.2  # 相邻滑动窗口的起点间隔
+    cue_offset_seconds: float = 0.5  # 相对 MI_START 延后多久开始第一个窗口
+    imagery_seconds: float = 4.0  # 每个试次的运动想象阶段长度
+    buffer_seconds: float = 10.0  # 环形缓冲保留的数据长度
+    chunk_samples: int = 25  # 每次读取的数据包采样点数上限
+    n_components: int = 4  # CSP 输出特征的分量数
+    threshold: float = 0.70  # 单个窗口的方向概率门限
+    confirmations: int = 3  # 输出方向前所需的连续同方向窗口数
+    max_abs_volts: float = 500e-6  # 单样本绝对幅度上限
+    flat_std_volts: float = 1e-9  # 识别平直信号的标准差门限
     max_ac_rms_volts: float = 100e-6
     flat_window_seconds: float = 1.0
     line_frequency_hz: float = 50.0
@@ -93,13 +78,14 @@ class Config:
     high_frequency_hz: float = 40.0
     max_high_frequency_power_fraction: float = 0.65
     saturation_run_seconds: float = 0.02
-    max_age_seconds: float = 0.5
-    timestamp_tolerance_seconds: float = 0.002
-    lsl_channel_labels: tuple[str, ...] | None = None
-    lsl_input_units: str | None = None
-    lsl_marker_grace_seconds: float = 0.10
+    max_age_seconds: float = 0.5  # 数据或结果允许的最大年龄
+    timestamp_tolerance_seconds: float = 0.002  # 采样间隔及部分时钟检查允许的偏差
+    lsl_channel_labels: tuple[str, ...] | None = None  # 按实际传输顺序声明的电极映射
+    lsl_input_units: str | None = None  # LSL 输入单位，用于换算到 V
+    lsl_marker_grace_seconds: float = 0.10  # 短暂保留 EEG，等待独立传输的阶段标记
 
     def __post_init__(self):
+        # 构造时统一检查类型、范围与参数关系，防止错误配置进入采集或模型。
         for parameter in fields(self):
             if parameter.type in (int, float):
                 value = getattr(self, parameter.name)
@@ -151,6 +137,7 @@ class Config:
             raise ValueError("Noise power fractions must be between zero and one")
         if not 0 <= self.lsl_marker_grace_seconds < self.max_age_seconds:
             raise ValueError("LSL marker grace must be nonnegative and below the maximum data age")
+        # 时长必须精确对应整数采样点，保证离线和在线使用相同的窗口边界。
         for duration in (self.window_seconds, self.step_seconds, self.cue_offset_seconds, self.imagery_seconds, self.warmup_seconds, self.buffer_seconds):
             if abs(duration * self.sfreq - round(duration * self.sfreq)) > 1e-8:
                 raise ValueError("Timing must map to integer samples")
@@ -179,12 +166,13 @@ class Config:
         return cls(**values)
 
 
+
 # ========================================================================
 # 02. 数据结构与模型接口
 # ========================================================================
-
 @dataclass(frozen=True)
 class StreamInfo:
+    # 描述进入核心处理流程后的数据约定，通道顺序必须与模型一致。
     sfreq: float
     channels: tuple[str, ...]
     reference: str
@@ -193,32 +181,35 @@ class StreamInfo:
 
 @dataclass(frozen=True)
 class EEGChunk:
-    data: np.ndarray  # channels x samples, volts
+    # 一批连续 EEG 样本；每个采样点对应一个时间戳。
+    data: np.ndarray  # 形状为 (通道数, 采样点数)，单位 V
     timestamps: np.ndarray
-    start_sample: int
+    start_sample: int  # 当前数据包首个样本的全局序号
     info: StreamInfo
-    segment_id: int = 0
-    received_at: float | None = None  # same clock as timestamps for a live source
+    segment_id: int = 0  # 连续采集段标识，用于识别重启边界
+    received_at: float | None = None  # 在线数据与 timestamps 使用同一接收端时钟
 
 
 @dataclass(frozen=True)
 class Marker:
-    kind: str  # RUN_START, TRIAL_START, MI_START, MI_END, DISCONNECT
-    sample: int
+    # 只描述实验阶段；类别真值通过独立日志按 trial_id 关联。
+    kind: str
+    sample: int  # 标记在接收端 EEG 采样网格上的位置
     trial_id: str | None = None
     timestamp: float | None = None
     segment_id: int = 0
     received_at: float | None = None
-    alignment_seconds: float | None = None  # first EEG sample at/after corrected marker, minus marker time
+    alignment_seconds: float | None = None  # 标记后首个 EEG 样本与标记的时间差
 
 
 @dataclass(frozen=True)
 class Prediction:
+    # 一个滑动窗口的预测记录；质量不合格时概率可为空。
     trial_id: str
     start_sample: int
-    stop_sample: int  # exclusive
-    probabilities: tuple[float, float] | None
-    timestamp: float  # acquisition time when full window becomes available
+    stop_sample: int  # 右开区间终点，窗口不包含此采样点
+    probabilities: tuple[float, float] | None  # 列顺序固定为 LEFT、RIGHT
+    timestamp: float  # 有效窗口最后一个已观测样本的采集时刻
     model_version: str
     quality: str = "OK"
     processing_seconds: float = 0.0
@@ -228,26 +219,29 @@ class Prediction:
 
 @dataclass(frozen=True)
 class Command:
+    # 判决结果及其时延信息；NO_COMMAND 表示不输出方向指令。
     trial_id: str | None
-    direction: str  # LEFT, RIGHT, NO_COMMAND
+    direction: str  # LEFT、RIGHT 或 NO_COMMAND
     sample: int
     timestamp: float
     reason: str
     processing_seconds: float = 0.0
-    emitted_at: float | None = None  # receiver's LSL clock; None for offline policy scoring
+    emitted_at: float | None = None  # 在线发布时的 LSL 时刻；离线判决可为空
     cue_to_output_seconds: float | None = None
     result_age_seconds: float | None = None
 
 
 class WindowModel(Protocol):
+    # 模型输入为“窗口数 × 通道数 × 采样点数”，输出两列左右手概率。
     def predict_proba(self, windows: np.ndarray) -> np.ndarray: ...
 
 
-# ========================================================================
-# 03. 采集接口
-# ========================================================================
 
+# ========================================================================
+# 03. 统一采集接口
+# ========================================================================
 class Source(Protocol):
+    # 真实采集与离线回放均产生 EEGChunk 或 Marker，供同一 Runtime 处理。
     info: StreamInfo
 
     def __iter__(self) -> Iterator[EEGChunk | Marker]: ...
@@ -255,32 +249,34 @@ class Source(Protocol):
     def close(self) -> None: ...
 
 
+
+
 # ========================================================================
 # 04. 个人采集数据与存储
 # ========================================================================
-
-
 @dataclass(frozen=True)
 class Trial:
+    # 一个独立试次的真值与定位信息，用于训练和评分。
     subject_id: str
     session_id: str
     run_id: int
     trial_id: str
     cue_sample: int
-    original_class: int  # Independent truth log: 1=LEFT, 2=RIGHT
+    original_class: int  # 独立真值日志：1=LEFT，2=RIGHT；训练时减 1
     artifact_flag: bool
     start_sample: int | None = None
 
 
 @dataclass
 class Recording:
+    # 完整录制及其试次表；只接受从个人 LSL 采集导入的 T/E 会话。
     data: np.ndarray
     timestamps: np.ndarray
     info: StreamInfo
     trials: list[Trial]
     run_starts: list[int]
     subject_id: str
-    session_id: str
+    session_id: str  # T 为校准训练会话，E 为独立测试会话
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -318,6 +314,7 @@ class Recording:
 
 
 def save_recording(path, recording: Recording) -> None:
+    # 将连续数据、时间戳和 JSON 元数据保存为便于训练及回放的 NPZ。
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -333,6 +330,7 @@ def save_recording(path, recording: Recording) -> None:
 
 
 def load_recording(path) -> Recording:
+    # 读取 NPZ 后重新构造 Recording，使导入数据再次经过结构校验。
     path = Path(path)
     if path.suffix.lower() != ".npz":
         raise ValueError("Expected a personal recording NPZ created by import-session")
@@ -351,21 +349,23 @@ def load_recording(path) -> Recording:
         )
 
 
-# ========================================================================
-# 05. 因果预处理
-# ========================================================================
 
+# ========================================================================
+# 05. 因果预处理：只使用当前及过去的样本
+# ========================================================================
 @dataclass(frozen=True)
 class FilteredChunk:
+    # 滤波结果同时保留有效性、连续段边界和逐样本拒绝原因。
     data: np.ndarray
     timestamps: np.ndarray
     sample_indices: np.ndarray
     valid: np.ndarray
-    breaks: np.ndarray
+    breaks: np.ndarray  # 当前位置是否开始新的滤波连续段
     reasons: np.ndarray
 
 
 class CausalPreprocessor:
+    # 跨数据包保留滤波状态；断点或坏样本会触发重置及预热。
     def __init__(self, config: Config, sos=None):
         self.config = config
         self.sos = np.array(sos if sos is not None else butter(
@@ -378,6 +378,7 @@ class CausalPreprocessor:
         self.reset()
 
     def reset(self):
+        # 二阶节状态形状为 (滤波节数, 通道数, 2)，每段从零状态开始。
         self._zi = np.zeros((len(self.sos), len(self.config.channels), 2))
         self._warmup = self.config.samples(self.config.warmup_seconds)
         self._next_sample = None
@@ -411,6 +412,7 @@ class CausalPreprocessor:
         filtered = np.full_like(data, np.nan)
         if not n:
             return FilteredChunk(filtered, timestamps.copy(), indices, valid, breaks, reasons)
+        # 同时检查序号与时间间隔；丢包后即使序号连续，时间戳仍可能暴露断点。
         same_segment = self._segment_id == chunk.segment_id
         if same_segment and self._next_sample is not None and chunk.start_sample < self._next_sample:
             raise ValueError("Overlapping or out-of-order samples would be processed twice")
@@ -433,19 +435,20 @@ class CausalPreprocessor:
             if not np.isfinite(chunk.received_at):
                 raise ValueError("received_at must be finite when supplied")
             stale = (chunk.received_at - timestamps) > cfg.max_age_seconds
-            # An acquisition timestamp in the future indicates a clock mismatch.
+            # 采集时间若明显晚于接收时间，说明时钟不一致，同样拒绝该样本。
             stale |= (timestamps - chunk.received_at) > cfg.timestamp_tolerance_seconds
             reasons[stale & good_signal] = "STALE_DATA"
+        # 只在连续且有效的区间内延续滤波状态，坏样本不会污染后续滤波。
         starts = np.unique(np.r_[0, np.flatnonzero(breaks), np.flatnonzero(~good_signal), n])
         for left, right in zip(starts[:-1], starts[1:]):
             if breaks[left]:
                 self._reset_filter()
             if not good_signal[left]:
-                # Each invalid sample is a boundary, so this interval is one sample.
                 self._reset_filter()
                 continue
             filtered[:, left:right], self._zi = sosfilt(
                 self.sos, data[:, left:right], axis=-1, zi=self._zi)
+            # 预热样本参与推进滤波状态，但不允许进入有效模型窗口。
             warm = min(self._warmup, right - left)
             reasons[left:left + warm] = np.where(stale[left:left + warm], "STALE_DATA", "WARMUP")
             self._warmup -= warm
@@ -457,21 +460,23 @@ class CausalPreprocessor:
         return FilteredChunk(filtered, timestamps.copy(), indices, valid, breaks, reasons)
 
 
-# ========================================================================
-# 06. 环形缓冲
-# ========================================================================
 
+# ========================================================================
+# 06. 环形缓冲与连续窗口读取
+# ========================================================================
 @dataclass(frozen=True)
 class BufferedWindow:
+    # 窗口快照同时携带原始信号与滤波信号，供质量检查和模型推断使用。
     data: np.ndarray
     raw_data: np.ndarray
     timestamps: np.ndarray
     valid: np.ndarray
-    epochs: np.ndarray
+    epochs: np.ndarray  # 连续段编号；跨段窗口不得用于推断
     reasons: np.ndarray
 
 
 class RingBuffer:
+    # 固定容量缓存按采样序号寻址，避免运行时间增长导致缓存无限扩张。
     def __init__(self, channels: int, capacity: int):
         if channels < 1 or capacity < 1:
             raise ValueError("Ring dimensions must be positive")
@@ -502,6 +507,7 @@ class RingBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def read(self, start: int, stop: int) -> BufferedWindow | None:
+        # 读取 [start, stop)；数据不足、已被覆盖或序号不连续时返回 None。
         count = stop - start
         if count <= 0 or count > self.size:
             return None
@@ -511,6 +517,7 @@ class RingBuffer:
             return None
         positions = (np.arange(self._position - offset - count,
                                self._position - offset) % self.capacity)
+        # 模运算只能找出缓存位置，还须核对采样序号，防止把断点两侧的数据拼接。
         if not np.array_equal(self.indices[positions], np.arange(start, stop)):
             return None
         return BufferedWindow(self.data[:, positions].copy(), self.raw_data[:, positions].copy(), self.timestamps[positions].copy(),
@@ -518,11 +525,12 @@ class RingBuffer:
                               self.reasons[positions].copy())
 
 
-# ========================================================================
-# 07. 指令判决
-# ========================================================================
 
+# ========================================================================
+# 07. 概率阈值、连续确认与单试次判决
+# ========================================================================
 class DecisionPolicy:
+    # 同一方向连续达到置信度门限后确认；每个 trial_id 最多输出一次方向。
     def __init__(self, config: Config):
         self.config = config
         self._committed_trials = set()
@@ -539,7 +547,7 @@ class DecisionPolicy:
         self.clear_streak()
 
     def clear_streak(self):
-        """Invalidate accumulated evidence without unlocking a committed trial."""
+        # 清除尚未确认的连续证据，但不解除已经输出过指令的试次锁定。
         self._direction = None
         self._streak = 0
 
@@ -558,6 +566,7 @@ class DecisionPolicy:
         if self._last_stop is not None and prediction.stop_sample <= self._last_stop:
             self.clear_streak()
             return output("NO_COMMAND", "STALE_DATA")
+        # 窗口缺失会打断连续确认，不能将时间上不相邻的证据累加。
         if self._last_stop is not None and prediction.stop_sample != self._last_stop + self.config.step_samples:
             self.clear_streak()
         self._last_stop = prediction.stop_sample
@@ -586,20 +595,22 @@ class DecisionPolicy:
     process = decide
 
 
-# ========================================================================
-# 08. 流式解码与状态机
-# ========================================================================
 
 NEUTRAL_MARKERS = frozenset({"RUN_START", "TRIAL_START", "MI_START", "MI_END", "DISCONNECT", "SESSION_END"})
 
 
+# ========================================================================
+# 08. 流式解码与实验阶段状态机
+# ========================================================================
 def iter_window_starts(config: Config, cue_sample: int):
+    # 只生成完整落在想象阶段内的窗口起点，终点采用右开区间。
     first = cue_sample + config.samples(config.cue_offset_seconds)
     last = cue_sample + config.samples(config.imagery_seconds) - config.window_samples
     return range(first, last + 1, config.step_samples)
 
 
 class Runtime:
+    # 将阶段标记、因果滤波、窗口质量检查、模型推断和指令判决串联起来。
     def __init__(self, config: Config, model, sos=None, model_version="unversioned", window_observer=None,
                  validity_guard=None):
         self.config, self.model, self.model_version = config, model, model_version
@@ -634,8 +645,7 @@ class Runtime:
         self.stats["bad_signal_samples"] += int(np.count_nonzero(filtered.reasons == "BAD_SIGNAL"))
         self.stats["stale_samples"] += int(np.count_nonzero(filtered.reasons == "STALE_DATA"))
         outputs = []
-        # Consume in acquisition order, not whole-chunk order: even a chunk larger
-        # than the ring cannot overwrite a window before its prediction is made.
+        # 逐样本写入并及时推断，避免大数据包先覆盖环形缓冲中尚未使用的窗口。
         for i, sample in enumerate(filtered.sample_indices):
             if filtered.breaks[i]:
                 self._epoch += 1
@@ -689,10 +699,8 @@ class Runtime:
               or np.any(np.abs(np.diff(window.timestamps) - 1.0 / self.config.sfreq)
                         > self.config.timestamp_tolerance_seconds)):
             quality = "BAD_SIGNAL"
+        # 用提示的真实采集时刻固定窗口位置，防止丢包后的连续编号掩盖时间漂移。
         elif self._cue_timestamp is not None:
-            # A source may number only delivered samples after a packet loss.
-            # Keep the cue's real acquisition-time anchor so later windows cannot
-            # silently slide past the intended imagery phase after such a loss.
             tolerance = max(1.0 / self.config.sfreq, self.config.timestamp_tolerance_seconds) + 1e-9
             expected_start = self._cue_timestamp + (start - self._cue) / self.config.sfreq
             expected_last = self._cue_timestamp + (stop - 1 - self._cue) / self.config.sfreq
@@ -700,8 +708,7 @@ class Runtime:
                     or abs(window.timestamps[-1] - expected_last) > tolerance):
                 quality = "BAD_SIGNAL"
         if quality == "OK":
-            # Freshness uses the last observed EEG sample. stop_sample remains
-            # exclusive, but its following sample time has not been observed yet.
+            # 时效性以最后一个已观测样本为准，右开终点对应的下一个样本尚未到达。
             timestamp = float(window.timestamps[-1])
             if self.validity_guard is not None:
                 quality = self.validity_guard(self.trial_id, timestamp) or "OK"
@@ -713,8 +720,7 @@ class Runtime:
                 probabilities = tuple(float(x) for x in p[0])
             except Exception:
                 quality = "MODEL_ERROR"
-        # Inference may have outlived the input, cue or connection. The guard reads
-        # acquisition state directly, never the decoder's possibly backlogged queue.
+        # 模型运行期间可能发生阶段结束或断流，因此推断后再检查采集线程的最新状态。
         if quality == "OK" and self.validity_guard is not None:
             quality = self.validity_guard(self.trial_id, timestamp) or "OK"
             if quality != "OK":
@@ -731,7 +737,7 @@ class Runtime:
         return [prediction, self.decision.decide(prediction)]
 
     def _flush(self, timestamp=None):
-        """Close pending windows as invalid; never infer retrospectively at phase end."""
+        # 阶段结束时将未凑齐的窗口记为无效，不追溯补做推断。
         outputs = []
         while self._active and self._next_window < len(self._starts):
             start = self._starts[self._next_window]
@@ -806,7 +812,6 @@ class Runtime:
             self._active = True
             self.decision.reset(trial_id)
             return outputs
-        # A mismatched old end marker must not terminate the current trial.
         if marker.trial_id is not None and marker.trial_id != self.trial_id:
             return []
         outputs = self._flush(marker.timestamp)
@@ -823,11 +828,12 @@ class Runtime:
         return outputs
 
 
-# ========================================================================
-# 09. 连续回放
-# ========================================================================
 
+# ========================================================================
+# 09. 按原始时间线连续回放
+# ========================================================================
 class ReplaySource:
+    # 按阶段边界拆分数据包，确保标记先于该位置的 EEG 到达解码器。
     def __init__(self, recording, chunk_samples=25, realtime=False, speed=1.0, imagery_seconds=4.0):
         if isinstance(chunk_samples, bool) or not isinstance(chunk_samples, Integral) or chunk_samples < 1:
             raise ValueError("Chunk size must be a positive integer")
@@ -862,7 +868,7 @@ class ReplaySource:
                 (trial.cue_sample, 3, "MI_START", trial.trial_id),
                 (trial.cue_sample + round(self.imagery_seconds * self.info.sfreq), 1, "MI_END", trial.trial_id),
             ])
-        # Never inspect original_class or artifact_flag when producing packets.
+        # 回放标记只使用阶段定位，不读取 original_class 或人工伪迹标签。
         markers.sort(key=lambda item: (item[0], item[1]))
         if any(m[0] > n_samples or m[0] < 0 for m in markers):
             raise ValueError("Marker outside recording")
@@ -894,15 +900,16 @@ class ReplaySource:
             position = end
 
 
-# ========================================================================
-# 10. LSL 设备采集
-# ========================================================================
 
 UNIT_SCALE = {"V": 1.0, "mV": 1e-3, "uV": 1e-6, "µV": 1e-6, "μV": 1e-6}
 NEUTRAL_KINDS = set(NEUTRAL_MARKERS)
 
 
+# ========================================================================
+# 10. LSL 设备采集与阶段标记对齐
+# ========================================================================
 def parse_neutral_marker(payload):
+    # 只允许 kind 和 trial_id，防止左右手真值通过阶段流进入解码器。
     value = json.loads(payload)
     if not isinstance(value, dict) or set(value) - {"kind", "trial_id"}:
         raise ValueError("Marker schema is strictly {kind, trial_id}; class labels are forbidden")
@@ -917,6 +924,7 @@ def parse_neutral_marker(payload):
 
 
 class LiveSource:
+    # 核对真实 LSL 流的采样率、通道、单位和参考，再转换成统一事件。
     is_live = True
 
     def __init__(self, config, eeg_name, marker_name, reference, units=None, resolve_timeout=5.0):
@@ -969,7 +977,7 @@ class LiveSource:
             if config.lsl_channel_labels is not None:
                 if len(config.lsl_channel_labels) != header.channel_count():
                     raise ValueError("Explicit LSL channel mapping length differs from the stream")
-                # This mapping is a user-declared wiring map, never inferred from channel count.
+                # 显式映射代表已核实的接线顺序，不能仅凭通道数量推测电极位置。
                 labels = list(config.lsl_channel_labels)
             if len(set(labels)) != len(labels) or any(c not in labels for c in config.channels):
                 raise ValueError("LSL metadata must name every required EEG electrode exactly once")
@@ -980,7 +988,7 @@ class LiveSource:
             reported_reference = header.desc().child_value("reference")
             if reported_reference and reported_reference != reference:
                 raise ValueError("Stream reference metadata conflicts with specified reference")
-            # Synchronization is performed by proc_clocksync on both inlets.
+            # 两个入口均由 proc_clocksync 校正到接收端时钟域，后续不手工重复加偏移。
             self.eeg.open_stream(timeout=resolve_timeout)
             self.markers.open_stream(timeout=resolve_timeout)
         except BaseException:
@@ -989,8 +997,7 @@ class LiveSource:
 
     def close(self):
         self._stop.set()
-        # A running iterator owns inlet teardown, avoiding races with pull_chunk.
-        # Constructor failure or close-before-iteration must release them here.
+        # 运行中的迭代器负责最终关闭入口，避免与正在执行的 pull_chunk 竞争。
         with self._state_lock:
             if not self._iterator_active:
                 self._close_inlets()
@@ -1011,7 +1018,7 @@ class LiveSource:
             raise RuntimeError(f"LSL inlet cleanup failed: {details}") from failures[0][1]
 
     def _released_eeg(self, values, times, index, segment):
-        """Remove yielded samples from the small raw holdback recovery queue."""
+        # 从待保留原始数据中扣除已交付的样本，避免退出恢复时重复记录。
         count = len(times)
         while count:
             packet = self.pending_raw[0]
@@ -1043,8 +1050,7 @@ class LiveSource:
         try:
             while not self._stop.is_set():
                 samples, stamps = self.eeg.pull_chunk(timeout=0.1, max_samples=self.config.chunk_samples)
-                # Remember received samples before marker parsing, including data
-                # from the pull which exposes a malformed/late marker.
+                # 先保留收到的原始样本；即使随后遇到错误标记，也可在收尾阶段恢复记录。
                 if stamps:
                     last_data = self.clock()
                     times = np.asarray(stamps, dtype=float)
@@ -1057,7 +1063,7 @@ class LiveSource:
                     last_received_stamp = float(times[-1])
                     self.safety.eeg(times[-1])
                     buffered.append((values, times, last_data))
-                # Consume all available markers before advancing the EEG timeline.
+                # 先收完当前可用标记，再推进 EEG 时间线。
                 while True:
                     payload, stamp = self.markers.pull_sample(timeout=0.0)
                     if payload is None:
@@ -1073,8 +1079,7 @@ class LiveSource:
                                                 "timestamp": float(stamp), "received_at": received,
                                                 "transport_age_seconds": received - float(stamp)})
                     pending.append((float(stamp), event, received))
-                # Hold EEG briefly so independently transported phase markers can catch up.
-                # Timestamps stay untouched; data age still includes this bounded holdback.
+                # 短暂延后交付 EEG，让独立传输的标记追上；原时间戳不变，等待仍计入数据年龄。
                 pending.sort(key=lambda pair: pair[0])
                 while buffered and self.clock() - buffered[0][2] >= self.config.lsl_marker_grace_seconds:
                     values, times, _ = buffered.pop(0)
@@ -1083,6 +1088,7 @@ class LiveSource:
                         stamp, event, received = pending.pop(0)
                         if previous_end is not None and stamp <= previous_end:
                             raise RuntimeError("Late marker arrived after its EEG was decoded; stopping to preserve causal alignment")
+                        # 标记对齐到时间戳不早于它的第一个 EEG 样本，并在该样本之前发出。
                         boundary = int(np.searchsorted(times, stamp, side="left"))
                         if boundary > position:
                             yield self._released_eeg(values[:, position:boundary], times[position:boundary], index + position, segment)
@@ -1113,10 +1119,10 @@ class LiveSource:
                 self._close_inlets()
 
 
-# ========================================================================
-# 11. 异步记录
-# ========================================================================
 
+# ========================================================================
+# 11. 异步记录与原始文件完整性检查
+# ========================================================================
 def json_value(value):
     if is_dataclass(value):
         return {"type": type(value).__name__, **asdict(value)}
@@ -1130,7 +1136,7 @@ def json_value(value):
 
 
 def write_json(path, value):
-    """Replace metadata only after a complete UTF-8 serialization and file write."""
+    # 先完成序列化和临时文件写入，再原子替换目标，避免留下半份 JSON。
     path = Path(path)
     encoded = json.dumps(value, ensure_ascii=False, indent=2, default=json_value, allow_nan=False)
     temporary = path.with_name(path.name + "." + uuid4().hex + ".tmp")
@@ -1144,6 +1150,7 @@ def write_json(path, value):
 
 
 class AsyncRecorder:
+    # 采集线程入队，写盘线程保存原始 EEG 与事件；队列满时明确报错。
     def __init__(self, directory, info, capacity=256):
         if capacity < 1:
             raise ValueError("Recorder capacity must be positive")
@@ -1167,7 +1174,7 @@ class AsyncRecorder:
         if self.error:
             raise RuntimeError("Recorder write failed") from self.error
         if isinstance(item, EEGChunk):
-            # Sources are free to reuse their acquisition buffers.
+            # 采集源可能复用数组；入队前复制，防止后台写盘读到后来覆盖的数据。
             item = EEGChunk(item.data.copy(), item.timestamps.copy(), item.start_sample, item.info, item.segment_id, item.received_at)
         try:
             self.queue.put(item, block=bool(timeout), timeout=timeout if timeout else None)
@@ -1190,8 +1197,7 @@ class AsyncRecorder:
                             raw.write(np.asarray(item.data.T, dtype="<f8").tobytes())
                             stamps.write(np.asarray(item.timestamps, dtype="<f8").tobytes())
                             chunks.write(json.dumps({"offset_samples": self.processed_raw_samples, "count": n, "start_sample": item.start_sample, "segment_id": item.segment_id, "received_at": item.received_at}) + "\n")
-                            # Python buffered writes are not proof of retained bytes.
-                            # raw_samples is confirmed from the closed files below.
+                            # 写入缓冲的样本数不等于已确认保存数，最终以关闭文件后的核验为准。
                             self.processed_raw_samples += n
                         else:
                             events.write(json.dumps(item, ensure_ascii=False, default=json_value, allow_nan=False) + "\n")
@@ -1201,7 +1207,7 @@ class AsyncRecorder:
             self.error = exc
 
     def _confirm_raw_storage(self):
-        """Confirm the common closed-file prefix, without claiming power-loss durability."""
+        # 核对已关闭文件与块索引共同确认的样本前缀；这不保证断电后的持久性。
         result = {"status": "unconfirmed", "confirmed_prefix_samples": 0,
                   "raw_file_samples": None, "timestamp_file_samples": None, "issues": [],
                   "scope": "Closed-file byte lengths plus complete contiguous chunk-index rows; no fsync/power-loss durability claim."}
@@ -1293,18 +1299,13 @@ class AsyncRecorder:
             raise RuntimeError("Recorder failed") from self.error
 
 
-# ========================================================================
-# 11a. 真人采集记录与独立标签合并
-# ========================================================================
 
+# ========================================================================
+# 11a. 合并真实采集记录与独立标签
+# ========================================================================
 def load_personal_session(directory, labels_path, *, subject_id=None, session_id=None) -> Recording:
-    """Import a completed personal capture without changing its EEG timeline.
-
-    Cue positions come exclusively from the recorder's neutral Marker.sample.
-    The external cue source's clock can differ from the receiving LSL clock, so its
-    timestamps are never used to locate EEG samples. Truth joins by trial ID;
-    the complete neutral event sequence must also agree with the truth log.
-    """
+    # 只导入完整采集，阶段位置以接收端 Marker.sample 为准，保持 EEG 时间线不变。
+    # 独立真值按 trial_id 合并，并核对完整阶段序列；不以发送端时间戳重新定位 EEG。
     directory, labels_path = Path(directory), Path(labels_path)
 
     def read_object(path):
@@ -1487,14 +1488,15 @@ def load_personal_session(directory, labels_path, *, subject_id=None, session_id
                                "artifact_annotation": "Not manually reviewed; runtime signal-quality checks remain active"})
 
 
-# ========================================================================
-# 12. 冻结模型包
-# ========================================================================
 
 CLASS_MAPPING = {"0": "LEFT", "1": "RIGHT"}
 
 
+# ========================================================================
+# 12. 冻结模型包与一致性校验
+# ========================================================================
 def canonical_json(value):
+    # 固定键顺序和分隔符，使同一份元数据生成稳定的摘要。
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
@@ -1509,6 +1511,7 @@ def dependency_versions():
 
 @dataclass
 class ModelBundle:
+    # 将模型、配置、滤波系数、版本及训练报告作为同一套部署资料保存。
     config: Config
     model: object
     sos: np.ndarray
@@ -1521,7 +1524,7 @@ class ModelBundle:
             raise ValueError("Only recorded-EEG models are supported; legacy synthetic models are not accepted")
         if self.metadata.get("recording_metadata", {}).get("source") != "personal_lsl":
             raise ValueError("Model must be trained from a personal LSL calibration recording")
-        # Reconstructing invokes every configuration invariant.
+        # 重新构造配置，确保模型包也通过所有参数约束。
         Config.from_dict(self.config.to_dict())
         sos = np.asarray(self.sos, dtype=float)
         if sos.shape != (self.config.filter_order, 6) or not np.isfinite(sos).all() or not np.allclose(sos[:, 3], 1):
@@ -1556,7 +1559,7 @@ class ModelBundle:
             raise ValueError("Frozen channel-quality policy is missing or differs; retrain from calibration data")
 
     def save(self, path):
-        """Save a directory containing manifest.json and model.joblib."""
+        # 模型文件、配置及清单均带摘要，用于加载时核对文件是否一致。
         self.validate()
         path = Path(path)
         path.mkdir(parents=True, exist_ok=False)
@@ -1582,7 +1585,7 @@ class ModelBundle:
 
     @classmethod
     def load(cls, path):
-        """Deserialize a TRUSTED local bundle. Never load an untrusted joblib."""
+        # joblib 反序列化只适用于可信来源的模型；摘要校验不能证明来源可信。
         path = Path(path)
         manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
         recorded_digest = manifest.pop("manifest_sha256", None)
@@ -1615,10 +1618,10 @@ def load_bundle(path):
     return ModelBundle.load(path)
 
 
-# ========================================================================
-# 13. 独立评估
-# ========================================================================
 
+# ========================================================================
+# 13. 按试次独立评估分类与指令
+# ========================================================================
 def _value(obj, key, default=None):
     return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
@@ -1633,12 +1636,13 @@ def _distribution(values):
 
 
 def _score(rows):
+    # 分类准确率只使用可分类试次；覆盖率和正确指令比例以全部目标试次为分母。
     classified = [r for r in rows if r["predicted_class"] is not None]
     emitted = [r for r in rows if r["command_class"] is not None]
     correct = sum(r["command_correct"] for r in emitted)
     truth = [r["target_class"] for r in classified]
     pred = [r["predicted_class"] for r in classified]
-    # Balanced accuracy is undefined if an entire target class is unobserved.
+    # 可分类试次缺少任一目标类别时，不报告可能误导的平衡准确率。
     balanced = float(balanced_accuracy_score(truth, pred)) if len(set(truth)) == 2 else None
     return {
         "target_trials": len(rows), "classified_trials": len(classified),
@@ -1679,14 +1683,9 @@ def _evaluation_parameters(config):
 
 def evaluate(trials, predictions, commands, *, sfreq, imagery_seconds=4.0,
              window_seconds=2.0, step_seconds=0.2, cue_offset_seconds=0.5, max_age_seconds=0.5):
-    """Score all target trials, keeping missing/rejected trials in denominators.
-
-    Classification averages the valid window probabilities within each trial.
-    LEFT/RIGHT commands are scored separately; NO_COMMAND never counts as a
-    directional command. Cue latency uses sample indices, avoiding replay wall
-    clock speed. Software processing time is reported separately, as measured
-    by the runtime; it is not a complete device/transport/display latency.
-    """
+    # 按试次平均有效窗口概率得到分类结果，方向指令单独评分。
+    # 缺失或被拒绝的试次仍计入覆盖率等指标；NO_COMMAND 不算方向指令。
+    # 采样序号用于计算提示到指令的时间，软件处理耗时与实际发布时延分别统计。
     if any(isinstance(v, bool) or not isinstance(v, Real) or not isfinite(v) or v <= 0
            for v in (sfreq, imagery_seconds, window_seconds, step_seconds, max_age_seconds)):
         raise ValueError("Evaluation rates and durations must be finite and positive")
@@ -1822,17 +1821,19 @@ def evaluate(trials, predictions, commands, *, sfreq, imagery_seconds=4.0,
     }
 
 
-# ========================================================================
-# 14. CSP 与 LDA 训练
-# ========================================================================
 
+# ========================================================================
+# 14. CSP 特征提取与 LDA 分类器训练
+# ========================================================================
 class _WindowProbe:
+    # 窗口提取用的占位模型返回等概率；有效窗口由观察回调收集。
     def predict_proba(self, windows):
         return np.full((len(windows), 2), 0.5)
 
 
 @dataclass
 class ExtractedWindows:
+    # 有效输入窗口及其对应预测位置；完整预测列表也保留被拒绝的窗口。
     windows: np.ndarray
     predictions: list
     valid_prediction_indices: list
@@ -1846,12 +1847,8 @@ def _recording_config(recording):
 
 
 def extract_windows(recording, config=None):
-    """Use the deployed Runtime unchanged; truth is never passed to its model.
-
-    The observation hook copies the exact causal, quality-approved input that
-    Runtime supplies to predict_proba. Invalid predictions remain in the result
-    so validation also replays streak resets caused by rejected windows.
-    """
+    # 复用部署时的 Runtime 获取经过因果滤波和质量检查的确切模型输入。
+    # 真值不传给占位模型；无效预测仍保留，供验证时重现连续确认的中断。
     config = config if config is not None else _recording_config(recording)
     windows, observed_keys, predictions = [], [], []
 
@@ -1872,6 +1869,7 @@ def extract_windows(recording, config=None):
 
 
 def make_pipeline(config):
+    # CSP 学习空间滤波并提取对数平均功率；LDA 使用自动收缩估计完成二分类。
     return Pipeline([
         ("csp", CSP(n_components=config.n_components, log=True, norm_trace=False,
                     transform_into="average_power")),
@@ -1880,6 +1878,7 @@ def make_pipeline(config):
 
 
 def _fit_model(config, x, y):
+    # 每折都新建并拟合 CSP/LDA，避免沿用其他折学习到的参数。
     if set(np.asarray(y).tolist()) != {0, 1}:
         raise ValueError("Every training fold needs valid LEFT and RIGHT windows")
     pipeline = make_pipeline(config)
@@ -1889,6 +1888,7 @@ def _fit_model(config, x, y):
 
 
 def _validation_commands(config, trials, predictions):
+    # 按试次和窗口时间顺序重放判决规则，重现拒绝窗口引起的连续证据清零。
     by_trial = {}
     for prediction in predictions:
         by_trial.setdefault(prediction.trial_id, []).append(prediction)
@@ -1913,8 +1913,8 @@ def _recording_digest(recording):
 
 
 class CalibrationDataError(ValueError):
-    """Data cannot support the declared calibration protocol; retain its audit."""
 
+    # 校准数据不足时保留详细审计报告，便于定位需要补采的项目。
     def __init__(self, report):
         self.report = report
         super().__init__("Calibration needs additional collection / 需要补采或调整采集：" + "; ".join(report["issues"]))
@@ -1923,12 +1923,8 @@ class CalibrationDataError(ValueError):
 def audit_calibration(recording, extraction, config, *, exclude_artifacts=True,
                       min_trials_per_class_per_run=10, max_class_ratio=2.0,
                       max_rejected_trial_fraction=0.5, max_rejected_window_fraction=0.5):
-    """Count independent trials, including entirely absent/rejected trials.
-
-    These configurable collection gates are engineering minimums, not a claim
-    that a particular sample count guarantees useful human performance.
-    Overlapping windows never increase the independent trial count.
-    """
+    # 按独立试次审计采集数量和拒绝比例，重叠窗口不增加独立试次数。
+    # 这些门限是工程最低要求，并不保证真人实验的识别效果。
     if (isinstance(min_trials_per_class_per_run, bool)
             or not isinstance(min_trials_per_class_per_run, Integral)
             or min_trials_per_class_per_run < 2):
@@ -2008,13 +2004,8 @@ def audit_calibration(recording, extraction, config, *, exclude_artifacts=True,
 def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confirmations=(2, 3), exclude_artifacts=True,
                     min_trials_per_class_per_run=10, max_class_ratio=2.0,
                     max_rejected_trial_fraction=0.5, max_rejected_window_fraction=0.5):
-    """Train only a T session; select the decision policy using held-out runs.
-
-    All overlapping windows from a trial and its entire run stay in one fold.
-    Expert artifact labels affect fitting only, never the runtime quality gate.
-    Validation reports include both clean and flagged trials. E sessions are
-    rejected before any window extraction, fit, or parameter selection.
-    """
+    # 仅用 T 会话拟合和选参；按整组 run 留出验证，避免重叠窗口跨折泄漏。
+    # 人工伪迹标签只影响拟合样本选择，验证报告仍包含带伪迹标记的试次。
     acquisition_config = _recording_config(recording)
     config = config if config is not None else acquisition_config
     if recording.metadata.get("synthetic"):
@@ -2023,9 +2014,7 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
         raise ValueError("Training requires a personal LSL calibration recording")
     if recording.session_id != "T":
         raise ValueError("Training requires a T session; E data must never select or fit parameters")
-    # Signal-processing settings may be chosen on calibration data and then
-    # frozen. Device identity and the actual recorded cue duration cannot be
-    # changed by a training override or replay would manufacture new phases.
+    # 可以在校准阶段选择处理参数，但不能改写设备身份或已采集的想象时长。
     for key in ("sfreq", "channels", "reference", "unit", "imagery_seconds"):
         if getattr(config, key) != getattr(acquisition_config, key):
             raise ValueError(f"Training configuration must preserve recorded {key}")
@@ -2065,10 +2054,12 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
                            for t in window_trials], dtype=bool)
     if not eligible.any():
         raise ValueError("No quality-approved left/right training windows")
+    # 原始标签 1/2 转为模型类别 0/1；同一试次的所有窗口保留所属 run。
     labels = np.asarray([t.original_class - 1 for t in window_trials])
     groups = np.asarray([t.run_id for t in window_trials])
     oof_predictions = list(extraction.predictions)
     fold_records = []
+    # 每次留出一整组；CSP 和 LDA 只拟合其余组，再预测留出组的有效窗口。
     for run_id in run_ids:
         fit_indices = np.flatnonzero(eligible & (groups != run_id))
         held_indices = np.flatnonzero(groups == run_id)
@@ -2103,6 +2094,7 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
         return (metrics["correct_command_fraction"] or 0, metrics["command_accuracy"] or 0,
                 candidate["threshold"], candidate["confirmations"])
 
+    # 使用校准集的折外预测选择阈值与确认次数；该分数不是独立测试成绩。
     selected = max(candidates, key=selection_key)
     frozen = replace(config, threshold=selected["threshold"], confirmations=selected["confirmations"])
     selected_commands = _validation_commands(frozen, trials, oof_predictions)
@@ -2112,6 +2104,7 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
         fold_ids = {t.trial_id for t in fold_trials}
         fold["metrics"] = evaluate(fold_trials, [p for p in oof_predictions if p.trial_id in fold_ids],
                                    [c for c in selected_commands if c.trial_id in fold_ids], **_evaluation_parameters(config))
+    # 判决策略选定后冻结配置，再用全部合格校准窗口训练最终部署模型。
     final_model = _fit_model(frozen, extraction.windows[eligible], labels[eligible])
     source_hash = _recording_digest(recording)
     versions = dependency_versions()
@@ -2158,13 +2151,13 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
     return bundle
 
 
-# ========================================================================
-# 15. 运行会话
-# ========================================================================
 
+# ========================================================================
+# 15. 采集、解码、发布与会话收尾
+# ========================================================================
 def _finalize_capture(recorder, config, source, summary, summary_name, target_status,
                       primary_error, cleanup_errors, received_raw_samples):
-    """Commit completion only after closed raw files and all required reports exist."""
+    # 原始文件关闭、完整性检查及必要报告写入后，才提交会话完成状态。
     directory = recorder.directory
     try:
         recorder.close(status="finalizing", error=primary_error or (cleanup_errors[0] if cleanup_errors else None),
@@ -2184,8 +2177,6 @@ def _finalize_capture(recorder, config, source, summary, summary_name, target_st
         return "failed" if primary_error is not None or recorder.error is not None or cleanup_errors else target_status
 
     def error_message():
-        # AsyncRecorder.close wraps writer failures; retain the original I/O
-        # cause rather than replacing it with the generic "Recorder failed".
         original = primary_error or recorder.error or (cleanup_errors[0] if cleanup_errors else None)
         return str(original) if original is not None else None
 
@@ -2208,8 +2199,6 @@ def _finalize_capture(recorder, config, source, summary, summary_name, target_st
                          "finalization_complete": not cleanup_errors})
         write_json(directory / "manifest.json", manifest)
 
-    # A diagnostic may read closed EEG while finalization is still pending. It
-    # must never mistake an active writer or an interrupted capture for complete.
     manifest.update({"status": "finalizing" if current_status() != "failed" else "failed",
                      "finalization_target_status": current_status(), "finalization_complete": False,
                      "error": error_message()})
@@ -2242,8 +2231,6 @@ def _finalize_capture(recorder, config, source, summary, summary_name, target_st
     except BaseException as exc:
         cleanup_errors.append(exc)
         update_summary()
-        # A transient error may clear. A failed run never regains complete merely
-        # because its failure summary can subsequently be written.
         try:
             write_json(directory / summary_name, summary)
         except BaseException as retry_exc:
@@ -2254,8 +2241,6 @@ def _finalize_capture(recorder, config, source, summary, summary_name, target_st
     except BaseException as exc:
         cleanup_errors.append(exc)
         update_summary()
-        # Atomic write_json leaves the previous finalizing/failed manifest in
-        # place on failure. Best-effort repair keeps readable summaries aligned.
         try:
             write_json(directory / summary_name, summary)
         except BaseException as repair_exc:
@@ -2270,11 +2255,7 @@ def _finalize_capture(recorder, config, source, summary, summary_name, target_st
 
 
 def record_session(source, config, output, observer=None, stop_event=None, context=None):
-    """Record calibration EEG and neutral phases without loading a classifier.
-
-    Raw samples are retained even when the causal quality check rejects them.
-    Cue classes belong in the external cue source's separate truth log, never this stream.
-    """
+    # 校准采集不加载分类器；原始 EEG 即使被质量检查拒绝也仍需保留。
     stop = stop_event if stop_event is not None else threading.Event()
     recorder = None
     iterator = None
@@ -2304,14 +2285,10 @@ def record_session(source, config, output, observer=None, stop_event=None, conte
                     raise RuntimeError("Acquisition ended without SESSION_END; capture is incomplete")
                 break
             except Exception:
-                # LiveSource's bounded no-data timeout may finish a pending
-                # pull after the caller has requested cancellation.
                 if stop.is_set():
                     cancelled = True
                     break
                 raise
-            # Retain the last received packet even when cancellation arrived
-            # during pull; signal validation and inference may stop afterwards.
             if isinstance(packet, EEGChunk):
                 counts["received_raw_samples"] += len(packet.timestamps)
             try:
@@ -2398,6 +2375,7 @@ def record_session(source, config, output, observer=None, stop_event=None, conte
 
 def run_session(source, bundle, output, observer=None, stop_event=None, queue_capacity=64, context=None,
                 result_stream_name="MI_Results"):
+    # 采集、写盘与解码通过有界队列协作，在线结果在发布前再次检查时效。
     if queue_capacity < 1:
         raise ValueError("Acquisition queue capacity must be positive")
     stop = stop_event if stop_event is not None else threading.Event()
@@ -2446,8 +2424,6 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
         try:
             recorder.record(packet, timeout=0 if live else 5)
         except RuntimeError:
-            # Stop decoding immediately on disk backlog; give the writer bounded
-            # time to retain this already-received packet before failing the run.
             if safety is not None:
                 safety.fail("RECORDER_FAILED")
             stop.set()
@@ -2463,6 +2439,7 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
             for packet in iterator:
                 if isinstance(packet, EEGChunk):
                     received_raw_samples += len(packet.timestamps)
+                # 原始记录先于推断入队，解码队列溢出时已接收数据仍有记录。
                 retain(packet)
                 if isinstance(packet, Marker) and packet.kind == "SESSION_END":
                     saw_session_end = True
@@ -2473,7 +2450,6 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
                         safety.marker(packet.kind, packet.trial_id, packet.timestamp)
                 if stop.is_set():
                     break
-                # Raw data has already been retained even if decoding overflows.
                 if live:
                     incoming.put_nowait(packet)
                 else:
@@ -2498,9 +2474,8 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
             except BaseException as exc:
                 failure.append(exc)
                 stop.set()
-            # Includes the chunk pulled before an invalid marker and holdback
-            # samples beyond SESSION_END. Never infer during this recovery path.
             try:
+                # 补存标记等待区中尚未交付的样本，退出恢复过程中不再进行模型推断。
                 received_raw_samples += sum(len(p.timestamps) for p in getattr(source, "pending_raw", []))
                 for packet in getattr(source, "pending_raw", []):
                     recorder.record(packet, timeout=5)
@@ -2530,8 +2505,7 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
             return command, deadline
 
         if isinstance(result, Command) and live:
-            # Disk preparation is outside the safety lock; the state check and
-            # LSL push occur together afterwards, with an absolute expiry.
+            # 磁盘准备工作在安全锁外完成；重新检查状态与 LSL 发送在同一锁内执行。
             row = publisher.publish(result, prepare=prepare, dispatch_lock=safety.lock)
             result = Command(**row["payload"])
         else:
@@ -2580,7 +2554,7 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
         worker.join(timeout=6)
         if worker.is_alive():
             cleanup_errors.append(RuntimeError("Acquisition thread did not stop within six seconds"))
-        # Packets still waiting for inference are already in the raw recorder.
+        # 这些待推断包已交给原始记录器，停止后清空解码队列即可。
         retained_after_stop = incoming.qsize()
         while not incoming.empty():
             incoming.get_nowait()
@@ -2630,13 +2604,13 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
             raise RuntimeError("Session cleanup failed") from (cleanup_errors or failure)[0]
     return predictions, commands
 
-# ========================================================================
-# 16. 采集线程安全状态与标记协议
-# ========================================================================
 
+# ========================================================================
+# 16. 采集线程的实时状态与标记协议
+# ========================================================================
 class MarkerProtocol:
-    """Reject missing, repeated, reordered and reused trial phases immediately."""
 
+    # 验证组与试次阶段的顺序，拒绝缺失、重复、乱序和复用的试次 ID。
     def __init__(self):
         self.run = False
         self.trial = None
@@ -2679,6 +2653,7 @@ class MarkerProtocol:
 
 
 class LiveSafety:
+    # 保存采集线程直接更新的状态；解码及发布阶段在锁内检查其有效性。
     def __init__(self, config, clock, stop_event):
         self.config, self.clock, self.stop = config, clock, stop_event
         self.lock = threading.RLock()
@@ -2726,14 +2701,15 @@ class LiveSafety:
                 return "MI_DEADLINE_EXCEEDED"
             return None
 
-# ========================================================================
-# 17. 稳定结果订阅接口
-# ========================================================================
 
 SCHEMA = "mi-results-v1"
 
 
+# ========================================================================
+# 17. 带有效期的结果发布与订阅
+# ========================================================================
 class ResultPublisher:
+    # 为结果附加会话 ID、递增序号、模型版本、运行模式及有效期。
     def __init__(self, directory, model_version, *, live=False, clock=time.monotonic,
                  stream_name="MI_Results", ttl=0.5, outlet=None):
         self.clock, self.ttl = clock, ttl
@@ -2770,8 +2746,7 @@ class ResultPublisher:
                 self.stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
                 self.stream.flush()
 
-            # A preparation is audit-only and is NEVER transmitted. Disk work must
-            # not hold the acquisition-state lock. Recheck after it completes.
+            # PreparedCommand 仅写审计日志；磁盘操作结束后重新确认状态，才发送最终指令。
             if prepare is not None:
                 log(envelope(result, "PreparedCommand"))
                 with dispatch_lock if dispatch_lock is not None else nullcontext():
@@ -2780,8 +2755,6 @@ class ResultPublisher:
                     if self.outlet is not None:
                         self.outlet.push_sample([json.dumps(row, ensure_ascii=False, allow_nan=False)],
                                                 timestamp=row["issued_at"])
-                # If this second write fails, the preparation remains auditable;
-                # delivery is uncertain and the session fails. Consumers expire.
                 log(row)
             else:
                 row = envelope(result)
@@ -2796,8 +2769,8 @@ class ResultPublisher:
 
 
 class ResultConsumer:
-    """Consumer-side duplicate, mode, clock, freshness and single-trial checks."""
 
+    # 订阅端独立验证会话、序号、时钟与有效期，并阻止同一试次重复执行。
     def __init__(self, timeout=0.5):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Subscription timeout must be positive and finite")
@@ -2836,7 +2809,7 @@ class ResultConsumer:
         payload = row.get("payload")
         if not isinstance(payload, dict):
             raise ValueError("Invalid result payload")
-        # A prediction is telemetry only and must not extend an actuator's lease.
+        # Prediction 仅用于观测，不更新方向指令的有效期。
         if row.get("type") not in {"Command", "Status"}:
             return None
         direction = payload.get("direction", "NO_COMMAND")
@@ -2890,9 +2863,6 @@ def subscribe(args):
         emit({"direction": "NO_COMMAND", "reason": "SUBSCRIBER_STOPPED"})
         inlet.close_stream()
 
-# ========================================================================
-# 18. 终端提示、随机平衡试次与独立标签
-# ========================================================================
 
 TIMING_LIMITATION = (
     "时间戳在终端写入并 flush 返回后立即取 LSL local_clock；"
@@ -2900,8 +2870,12 @@ TIMING_LIMITATION = (
 )
 
 
+# ========================================================================
+# 18. 终端提示、随机平衡试次与独立标签日志
+# ========================================================================
 @dataclass(frozen=True)
 class ExperimentConfig:
+    # 终端实验的组数、试次数、各阶段时长及随机种子配置。
     subject_id: str
     session_id: str = "T"
     runs: int = 2
@@ -2939,7 +2913,7 @@ class ExperimentConfig:
 
 
 def make_schedule(config, experiment_id):
-    """Same seed reproduces class order; independent UUIDs prevent ID reuse."""
+    # 相同种子复现类别顺序，独立 UUID 避免不同实验复用试次标识。
     rng = random.Random(config.seed)
     schedule = []
     for run in range(1, config.runs + 1):
@@ -2987,15 +2961,8 @@ def _native_outlet(config, experiment_id):
 
 def run_experiment(config, output, *, outlet=None, clock=None, sleep=time.sleep,
                    presenter=terminal_presenter):
-    """Emit neutral phases and persist a separate truth log.
-
-    Inject outlet + LSL-domain clock together for software tests. The outlet must
-    implement wait_for_consumers(timeout), have_consumers(), and push_sample().
-    Each truth row stores the exact marker source timestamp plus push start/end
-    times. These measure sender work only, never receiver delay or visual onset.
-    A failed/aborted run emits DISCONNECT best-effort, stays visibly incomplete,
-    and cannot satisfy the strict personal-session import contract.
-    """
+    # 向 LSL 发送中性阶段标记，将类别保存到独立标签日志。
+    # 注入测试依赖时，outlet 与 LSL 时钟须同时提供；失败会保留未完成状态。
     if (outlet is None) != (clock is None):
         raise ValueError("outlet 和 clock 必须一起注入")
     output = Path(output)
@@ -3034,7 +3001,7 @@ def run_experiment(config, output, *, outlet=None, clock=None, sleep=time.sleep,
         if check_consumer and not outlet.have_consumers():
             raise RuntimeError("标记接收端已断开；实验中止")
         presenter(message)
-        # No logging, formatting or I/O between presentation completion and onset.
+        # 提示输出返回后立即取时钟，减少日志等额外操作带来的时间偏差。
         stamp = checked_clock()
         if stamp < previous_timestamp:
             raise RuntimeError("LSL 源时钟倒退；实验中止")
@@ -3051,8 +3018,7 @@ def run_experiment(config, output, *, outlet=None, clock=None, sleep=time.sleep,
                "presentation_clock": "pylsl.local_clock_after_terminal_flush"}
         if original_class is not None:
             row["original_class"] = original_class
-        # The stream never sees labels. If persistence fails after sending, abort
-        # immediately; the mismatched/incomplete log cannot be imported as valid.
+        # 类别只写入本地真值日志；若写入失败则中止，避免把不完整实验标为完成。
         _append_row(labels, row)
         return stamp
 
@@ -3084,7 +3050,6 @@ def run_experiment(config, output, *, outlet=None, clock=None, sleep=time.sleep,
             active_trial = None
             wait_until(onset + config.inter_trial_seconds)
         emit("SESSION_END", "本次提示已完成，请等待采集器保存数据。")
-        # Give the final sample time to leave the outlet before its destruction.
         sleep(config.drain_seconds)
         manifest["status"] = "complete"
         manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
@@ -3157,14 +3122,14 @@ def cmd_experiment(args):
     manifest = run_experiment(config_from_args(args), args.output)
     print(f"提示记录完成：{Path(args.output).resolve()}；已完成 {manifest['completed_trials']} 次提示，EEG 有效性须另行检查。")
 
+
 # ========================================================================
 # 19. 真实设备预检与采集质量报告
 # ========================================================================
-
 @dataclass(frozen=True)
 class QualityThresholds:
-    """工程预检初始阈值；须在实际设备上核定，所有失败均阻止 ready。"""
 
+    # 工程预检初始门限，需要结合真实设备核定；失败项会阻止预检就绪。
     min_duration_seconds: float = 5.0
     max_rate_error_fraction: float = 0.05
     max_timestamp_error_seconds: float = 0.002
@@ -3179,7 +3144,6 @@ class QualityThresholds:
     max_line_power_fraction: float = 0.35
     high_frequency_hz: float = 40.0
     max_high_frequency_power_fraction: float = 0.65
-    # A repeated exact extremum suggests clipping but does not identify the ADC rail.
     saturation_run_seconds: float = 0.02
 
     def __post_init__(self):
@@ -3232,7 +3196,7 @@ def _longest_run(mask):
 
 
 def channel_quality_report(data_volts, sfreq, channels, thresholds=None):
-    """逐通道原始信号报告，输入固定为 (channels, samples)，不修改/重排输入。"""
+    # 输入为原始伏特信号 (通道数, 采样点数)，逐通道检查幅度、平直及频谱噪声。
     limits = thresholds or QualityThresholds()
     data = np.asarray(data_volts, dtype=float)
     if not np.isfinite(sfreq) or sfreq <= 0:
@@ -3251,7 +3215,7 @@ def channel_quality_report(data_volts, sfreq, channels, thresholds=None):
             reasons.append("NONFINITE")
         maximum = float(np.max(np.abs(good))) if len(good) else None
         std = float(np.std(good)) if len(good) else None
-        # Overlap catches flat intervals that straddle the fixed window boundaries.
+        # 重叠检查能发现跨固定窗口边界的平直区间。
         starts = list(range(0, max(0, len(samples) - window + 1), max(1, window // 2)))
         if len(samples) >= window and (not starts or starts[-1] != len(samples) - window):
             starts.append(len(samples) - window)
@@ -3263,7 +3227,7 @@ def channel_quality_report(data_volts, sfreq, channels, thresholds=None):
             reasons.append("EXCESSIVE_AMPLITUDE")
         if std is not None and std > limits.max_ac_rms_volts:
             reasons.append("EXCESSIVE_AC_RMS")
-        # Do not interpolate or concatenate across invalid samples for the spectrum.
+        # 频谱检查要求完整有限的原始数据，不跨坏样本插值或拼接。
         line_fraction = high_fraction = None
         line_observable = limits.line_frequency_hz + limits.line_bandwidth_hz < sfreq / 2
         high_observable = limits.high_frequency_hz < sfreq / 2
@@ -3297,7 +3261,7 @@ def channel_quality_report(data_volts, sfreq, channels, thresholds=None):
 
 
 def timing_report(timestamps, received_at, sfreq, elapsed_seconds, max_silence_seconds=0.0, thresholds=None):
-    """接收时刻须与校正后的 LSL 时间戳同钟域；每个样本保存其所属包的接收时刻。"""
+    # 样本时间与其所属数据包的接收时间必须处于同一时钟域，才能计算数据年龄。
     limits = thresholds or QualityThresholds()
     stamps, arrivals = np.asarray(timestamps, dtype=float), np.asarray(received_at, dtype=float)
     if stamps.ndim != 1 or arrivals.shape != stamps.shape:
@@ -3383,7 +3347,7 @@ def _stream_mapping(header, config, units):
 
 def capture_preflight(config, eeg_name, duration_seconds=15.0, thresholds=None, units=None,
                       resolve_timeout=5.0, *, lsl_module=None, monotonic=None):
-    """只连接指定真实 EEG 流，限时采集，关闭 inlet 后生成预检结果。"""
+    # 限时采集指定真实 EEG 流，关闭入口后生成通道质量和时序预检结果。
     limits = thresholds or QualityThresholds.for_config(config)
     if not np.isfinite(duration_seconds) or duration_seconds < limits.min_duration_seconds:
         raise ValueError(f"Preflight duration must be at least {limits.min_duration_seconds:g} seconds")
@@ -3406,9 +3370,8 @@ def capture_preflight(config, eeg_name, duration_seconds=15.0, thresholds=None, 
                     "configured_channels": list(config.channels), "reference": config.reference,
                     "unit": "V", "processing_flags": "proc_clocksync (no dejitter)"}
         inlet.open_stream(timeout=resolve_timeout)
-        # Establish the offset before accepting samples. Only proc_clocksync applies it.
         metadata["initial_clock_correction_seconds"] = float(inlet.time_correction(timeout=resolve_timeout))
-        # Drain any samples accumulated during clock initialization, avoiding stale startup backlog.
+        # 丢弃时钟初始化期间积压的样本，避免预检一开始就统计过期数据。
         inlet.flush()
         began = last_received = monotonic()
         while monotonic() - began < duration_seconds:
@@ -3446,7 +3409,6 @@ def capture_preflight(config, eeg_name, duration_seconds=15.0, thresholds=None, 
 
 
 def cmd_preflight(args, config=None):
-    """读取并验证唯一主文件中的设备配置。"""
     output = Path(args.output)
     if output.exists():
         raise FileExistsError(f"Report already exists: {output}")
@@ -3468,7 +3430,7 @@ def cmd_preflight(args, config=None):
 
 
 def _save_diagnostic(directory, filename, report):
-    """附加诊断不覆盖采集的原始错误；写盘错误仍明确反馈给调用者。"""
+    # 附加诊断写盘失败时明确报告，但不替换采集过程的原始错误。
     try:
         with (Path(directory) / filename).open("w", encoding="utf-8") as stream:
             json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
@@ -3479,6 +3441,7 @@ def _save_diagnostic(directory, filename, report):
 
 
 def _capture_maps(directory, config):
+    # 通过内存映射访问录制文件，避免将长会话的原始 EEG 整体复制进内存。
     directory = Path(directory)
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     stream = manifest.get("stream", {})
@@ -3507,7 +3470,7 @@ def _capture_maps(directory, config):
 
 
 def _capture_segments(directory, available, problems):
-    """仅读取轻量 chunk 索引；不复制原始录制。损坏后的字节仍在原文件中。"""
+    # 依据轻量块索引划分连续段，保留原始文件中可能不完整的数据供诊断。
     segments, expected = [], 0
     with (Path(directory) / "chunks.jsonl").open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
@@ -3537,11 +3500,8 @@ def _capture_segments(directory, available, problems):
 
 
 def write_capture_quality(directory, config):
-    """按连续采集段、非重叠窗口汇总质量，原始信号工作内存与会话长度无关。
-
-    这是原始信号诊断窗口比例，不冒充因果滤波后模型有效窗口比例。
-    缺文件、部分写盘及诊断写盘故障返回 incomplete，不遮蔽采集主因。
-    """
+    # 按连续段和非重叠原始窗口汇总质量，控制诊断内存用量。
+    # 此处的原始信号窗口通过率，不等于因果滤波后模型窗口的有效比例。
     report = {"format": "mi-bci-capture-channel-quality-v1", "status": "incomplete", "issues": [],
               "channels": [], "segments": [],
               "scope": "Raw-voltage nonoverlapping diagnostic windows; not the causal model's valid-window fraction.",
@@ -3571,7 +3531,6 @@ def write_capture_quality(directory, config):
             for begin in range(segment["start_offset"], segment["stop_offset"], width):
                 end = min(begin + width, segment["stop_offset"])
                 complete = end - begin == width
-                # Bounded views/temporary arrays, never a complete recording copy.
                 rows = channel_quality_report(raw[begin:end].T, config.sfreq, config.channels, limits)
                 times = stamps[max(segment["start_offset"], begin - 1):end]
                 delta = np.diff(times)
@@ -3597,7 +3556,6 @@ def write_capture_quality(directory, config):
                             any_bad = True
                     else:
                         total["incomplete_tail_samples"] += end - begin
-                        # These obvious defects remain visible even in an unscorable tail.
                         for reason in row["reasons"]:
                             if reason != "INSUFFICIENT_DATA":
                                 total.setdefault("tail_reasons", set()).add(reason)
@@ -3627,8 +3585,8 @@ def write_capture_quality(directory, config):
 
 
 class _BoundedStats:
-    """均匀随机保留最多 50k 观测；总数/min/max 精确，分位数标注为近似。"""
 
+    # 蓄水池抽样限制统计内存：数量与极值精确，抽样分位数为近似值。
     def __init__(self, capacity=50000):
         self.capacity = capacity
         self.values = np.empty(0)
@@ -3661,7 +3619,7 @@ class _BoundedStats:
 
 
 def write_capture_timing(directory, config, timing_records=None):
-    """保存分离的 EEG 抖动、标记接收年龄、格点对齐报告；建议不修改配置/模型。"""
+    # 分别报告 EEG 抖动、标记接收年龄与采样格点对齐，不能据此确认物理提示起点。
     report = {"format": "mi-bci-capture-timing-v1", "status": "incomplete", "issues": [],
               "physical_cue_alignment": {"status": "not_measured", "reason": "Need a photodiode/audio-loopback/trigger channel to observe actual cue onset on the EEG acquisition clock."},
               "scope": "Software clock-corrected timestamps and receive times; not physical acquisition/display onset latency.",
@@ -3746,8 +3704,6 @@ def write_capture_timing(directory, config, timing_records=None):
                     if len(matches) == 1:
                         recorded_offset = matches[0]
                         if np.isfinite(stamps[recorded_offset]):
-                            # Sample numbering can differ from file offsets after a gap.
-                            # This recovers only the observed EEG grid, never physical cue onset.
                             value = float(stamps[recorded_offset] - timestamp)
                             source = "derived_from_recorded_grid"
                         else:
@@ -3822,12 +3778,12 @@ def write_capture_timing(directory, config, timing_records=None):
     return _save_diagnostic(directory, "alignment_report.json", report)
 
 
-# ========================================================================
-# 20. 命令行与主入口
-# ========================================================================
 
+# ========================================================================
+# 20. 命令行处理与主入口
+# ========================================================================
 def _timeline_digest(recording):
-    """Identity of signal, timestamps and neutral cue alignment, excluding truth."""
+    # 摘要覆盖信号、时间戳及中性阶段定位，刻意排除类别真值。
     hasher = sha256()
     for array in (recording.data, recording.timestamps):
         hasher.update(np.ascontiguousarray(array).view(np.uint8))
@@ -3975,6 +3931,7 @@ def cmd_inspect_lsl(args):
 
 
 def cmd_configure_lsl(args):
+    # 读取实际设备流生成配置，电极映射及参考必须由使用者确认。
     target = Path(args.output)
     if target.exists():
         raise FileExistsError(f"Configuration already exists: {target}")
@@ -4005,7 +3962,6 @@ def cmd_configure_lsl(args):
         raise ValueError("Requested input units conflict with stream metadata")
     if header["reference"] and header["reference"] != args.reference:
         raise ValueError("Requested reference conflicts with stream metadata")
-    # Use the rate actually exported by the GUI; this command does not reprogram the amplifier.
     timings = {name: round(seconds * rate) / rate for name, seconds in
                (("warmup_seconds", 1), ("window_seconds", 2), ("step_seconds", .2),
                 ("cue_offset_seconds", .5), ("imagery_seconds", 4), ("buffer_seconds", 10))}
@@ -4057,7 +4013,7 @@ def cmd_import_session(args):
 
 
 def _verify_live_output(directory, context, predictions, commands):
-    """Cross-check actual runtime and published output, not just a context label."""
+    # 交叉核对实际运行记录与发布日志，确认评分对象确实来自在线会话。
     directory = Path(directory)
     summary = json.loads((directory / "runtime_summary.json").read_text(encoding="utf-8"))
     if (summary.get("mode") != "live" or summary.get("model_version") != context["model_version"]
@@ -4097,6 +4053,7 @@ def _verify_live_output(directory, context, predictions, commands):
 
 
 def cmd_evaluate_live(args):
+    # 对独立 E 会话中当时实际产生的预测及指令评分。
     if Path(args.output).exists():
         raise FileExistsError(f"Output already exists: {args.output}")
     recording = load_personal_session(args.session, args.labels)
@@ -4145,6 +4102,7 @@ def cmd_live(args):
 
 
 def main(argv=None):
+    # 注册子命令并分派处理函数；无参数时仅显示帮助，不启动设备或训练。
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         prog="main.py", description="真实 EEG 运动想象命令行系统：LSL 原始数据采集与在线解码",
@@ -4235,6 +4193,7 @@ def main(argv=None):
     if not argv:
         parser.print_help()
         return 0
+    # 各子命令通过 set_defaults(func=...) 绑定处理函数，此处统一解析与调用。
     args = parser.parse_args(argv)
     try:
         result = args.func(args)
