@@ -1,82 +1,76 @@
-"""单文件运动想象 BCI 主程序（Python 3.10+）。
+"""单文件运动想象 BCI 命令行程序（Python 3.10+，真实 EEG / LSL）。
 
-直接启动界面：  python main.py
-查看命令帮助：  python main.py --help
-无界面演示：    python main.py demo --output <新目录>
-导入真实数据：  python main.py import-gdf A01T.gdf --output A01T.npz
-训练模型：      python main.py train A01T.npz --model <模型目录>
-回放与反馈：    python main.py replay A01E.npz --model <模型目录> --output <新目录> --ui
-设备接入：      python main.py live --help
+查看使用说明：  python main.py
 查看设备流：    python main.py inspect-lsl
 生成设备配置：  python main.py configure-lsl --help
 个人校准采集：  python main.py record --help
 导入个人采集：  python main.py import-session --help
+训练个人模型：  python main.py train calibration.npz --model <新模型目录>
+在线解码记录：  python main.py live --model <个人模型目录> --subject <受试者ID> --eeg-name <原始EEG流名> --output <新目录>
 真实在线评分：  python main.py evaluate-live --help
+个人数据回放：  python main.py replay personal_test.npz --model <个人模型目录> --output <新目录> --realtime
 
-依赖安装：      python -m pip install numpy scipy scikit-learn mne joblib
-LSL 可选依赖：  python -m pip install pylsl
-也可通过同目录 pyproject.toml 安装：python -m pip install -e .
+依赖安装：      python -m pip install -r requirements.lock.txt
+pylsl 还需要当前系统可加载的 liblsl 库。
 
-无参数运行使用合成数据，不代表真人脑电准确率。
-默认演示结果存入用户数据目录 MI_BCI/runs；显式 --output 可选择保存位置。
-所有项目代码都在本文件中，不依赖原 mi_bci 文件夹。
+真实设备流程：确认原始 EEG 流、通道位置、单位和参考电极 → 采集本人校准数据
+（至少两组左右手试次）→ 导入并训练 → 使用冻结模型进行独立在线测试。
+record/live 需要外部实验程序提供独立的 LSL 阶段标记流（默认 MI_Markers）；
+标记为单通道 JSON 字符串，只含 kind 和 trial_id，不含左右手类别。
+外部程序还须保存独立标签 JSONL，供 import-session / evaluate-live 使用。
+experiment 子命令提供可重复终端提示和独立标签日志；不含图形界面。
+无参数运行仅显示帮助，不会生成数据、训练模型或启动采集。
 """
 
-from dataclasses import asdict, dataclass, fields
-from math import isfinite
-from numbers import Integral, Real
-from dataclasses import dataclass
-from typing import Protocol
-import numpy as np
-from typing import Iterator, Protocol
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Any
-import json
-import re
-from scipy.signal import butter, sosfilt
-from time import perf_counter
-import threading
-import time
-from dataclasses import asdict, is_dataclass
-import queue
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from datetime import datetime, timezone
 from hashlib import sha256
 from importlib.metadata import version as package_version
-import platform
-import warnings
-import joblib
-from scipy.signal import butter
-from collections import Counter, defaultdict
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix
-from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
-import mne
-from mne.decoding import CSP
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.pipeline import Pipeline
-import argparse
-from dataclasses import asdict, replace
-import sys
-import os
+from math import isfinite
+from numbers import Integral, Real
+from pathlib import Path
+from time import perf_counter
+from typing import Any, Iterator, Protocol
 from uuid import uuid4
+import argparse
+import json
+import math
+import os
+import platform
+import queue
+import random
+import re
+import sys
+import threading
+import time
+import uuid
+import warnings
 
-__version__ = "0.1.0"
+import joblib
+import mne
+import numpy as np
+from mne.decoding import CSP
+from scipy.signal import butter, sosfilt, welch
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix
+from sklearn.pipeline import Pipeline
+
+
+__version__ = "0.3.0"
 
 
 # ========================================================================
 # 01. 参数配置
 # ========================================================================
 
-EEG_CHANNELS = ("Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1", "Cz", "C2", "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz", "P2", "POz")
-
-
 @dataclass(frozen=True)
 class Config:
-    sfreq: float = 250.0
-    channels: tuple[str, ...] = EEG_CHANNELS
+    sfreq: float
+    channels: tuple[str, ...]
+    reference: str
     unit: str = "V"
-    reference: str = "left_mastoid"
     low_hz: float = 8.0
     high_hz: float = 30.0
     filter_order: int = 4
@@ -92,6 +86,13 @@ class Config:
     confirmations: int = 3
     max_abs_volts: float = 500e-6
     flat_std_volts: float = 1e-9
+    max_ac_rms_volts: float = 100e-6
+    flat_window_seconds: float = 1.0
+    line_frequency_hz: float = 50.0
+    max_line_power_fraction: float = 0.35
+    high_frequency_hz: float = 40.0
+    max_high_frequency_power_fraction: float = 0.65
+    saturation_run_seconds: float = 0.02
     max_age_seconds: float = 0.5
     timestamp_tolerance_seconds: float = 0.002
     lsl_channel_labels: tuple[str, ...] | None = None
@@ -143,6 +144,11 @@ class Config:
             raise ValueError("Buffer must hold a complete window")
         if self.max_abs_volts <= 0 or self.flat_std_volts < 0 or self.max_age_seconds <= 0 or self.timestamp_tolerance_seconds < 0:
             raise ValueError("Invalid quality limits")
+        if min(self.max_ac_rms_volts, self.flat_window_seconds, self.line_frequency_hz,
+               self.high_frequency_hz, self.saturation_run_seconds) <= 0:
+            raise ValueError("Channel quality limits must be positive")
+        if not (0 < self.max_line_power_fraction < 1 and 0 < self.max_high_frequency_power_fraction < 1):
+            raise ValueError("Noise power fractions must be between zero and one")
         if not 0 <= self.lsl_marker_grace_seconds < self.max_age_seconds:
             raise ValueError("LSL marker grace must be nonnegative and below the maximum data age")
         for duration in (self.window_seconds, self.step_seconds, self.cue_offset_seconds, self.imagery_seconds, self.warmup_seconds, self.buffer_seconds):
@@ -166,6 +172,8 @@ class Config:
     @classmethod
     def from_dict(cls, values):
         values = dict(values)
+        if not {"sfreq", "channels", "reference"}.issubset(values):
+            raise ValueError("Configuration requires the actual device sample rate, channels and reference; use configure-lsl")
         if "channels" in values:
             values["channels"] = tuple(values["channels"])
         return cls(**values)
@@ -179,8 +187,8 @@ class Config:
 class StreamInfo:
     sfreq: float
     channels: tuple[str, ...]
+    reference: str
     unit: str = "V"
-    reference: str = "left_mastoid"
 
 
 @dataclass(frozen=True)
@@ -200,6 +208,8 @@ class Marker:
     trial_id: str | None = None
     timestamp: float | None = None
     segment_id: int = 0
+    received_at: float | None = None
+    alignment_seconds: float | None = None  # first EEG sample at/after corrected marker, minus marker time
 
 
 @dataclass(frozen=True)
@@ -212,6 +222,8 @@ class Prediction:
     model_version: str
     quality: str = "OK"
     processing_seconds: float = 0.0
+    bad_channels: tuple[str, ...] = ()
+    channel_quality_reasons: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -222,6 +234,9 @@ class Command:
     timestamp: float
     reason: str
     processing_seconds: float = 0.0
+    emitted_at: float | None = None  # receiver's LSL clock; None for offline policy scoring
+    cue_to_output_seconds: float | None = None
+    result_age_seconds: float | None = None
 
 
 class WindowModel(Protocol):
@@ -241,11 +256,8 @@ class Source(Protocol):
 
 
 # ========================================================================
-# 04. Dataset 2a 导入与标签对齐
+# 04. 个人采集数据与存储
 # ========================================================================
-
-EVENT_ID = {str(code): code for code in (768, 769, 770, 771, 772, 783, 1023, 32766)}
-CUE_CODES = (769, 770, 771, 772, 783)
 
 
 @dataclass(frozen=True)
@@ -255,7 +267,7 @@ class Trial:
     run_id: int
     trial_id: str
     cue_sample: int
-    original_class: int | None
+    original_class: int  # Independent truth log: 1=LEFT, 2=RIGHT
     artifact_flag: bool
     start_sample: int | None = None
 
@@ -269,10 +281,15 @@ class Recording:
     run_starts: list[int]
     subject_id: str
     session_id: str
-    eog: np.ndarray | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        if not isinstance(self.session_id, str) or self.session_id not in {"T", "E"}:
+            raise ValueError("Personal recording session_id must be T or E")
+        if self.metadata.get("synthetic"):
+            raise ValueError("Only recorded EEG is supported; legacy synthetic recordings are not accepted")
+        if self.metadata.get("source") != "personal_lsl":
+            raise ValueError("Only personal LSL recordings are supported; import a completed capture with import-session")
         self.data = np.asarray(self.data, dtype=np.float64)
         self.timestamps = np.asarray(self.timestamps, dtype=np.float64)
         if self.data.ndim != 2 or self.data.shape[0] != len(self.info.channels):
@@ -283,14 +300,11 @@ class Recording:
             raise ValueError("Recording requires a positive sample rate and volts")
         if not np.all(np.isfinite(self.timestamps)) or np.any(np.diff(self.timestamps) <= 0):
             raise ValueError("Recording timestamps must be finite and strictly increasing")
-        if self.eog is not None:
-            self.eog = np.asarray(self.eog, dtype=np.float64)
-            if self.eog.shape != (3, self.data.shape[1]):
-                raise ValueError("EOG must have three channels and the EEG sample count")
         if len({t.trial_id for t in self.trials}) != len(self.trials):
             raise ValueError("Trial identifiers must be unique")
-        if any(t.original_class not in (None, 1, 2, 3, 4) for t in self.trials):
-            raise ValueError("Original classes must be 1..4 or unknown")
+        if any(isinstance(t.original_class, bool) or not isinstance(t.original_class, Integral)
+               or t.original_class not in (1, 2) for t in self.trials):
+            raise ValueError("Personal truth labels must be 1=LEFT or 2=RIGHT")
         if any(t.subject_id != self.subject_id or t.session_id != self.session_id for t in self.trials):
             raise ValueError("Trial subject/session differs from recording")
         if any(not 0 <= t.cue_sample < self.data.shape[1] for t in self.trials):
@@ -301,205 +315,6 @@ class Recording:
             raise ValueError("Trials must be in chronological order")
         if self.run_starts != sorted(set(self.run_starts)) or any(not 0 <= x < self.data.shape[1] for x in self.run_starts):
             raise ValueError("Run starts must be unique, sorted, and within the recording")
-
-
-def _event_pairs(events) -> np.ndarray:
-    """Accept Nx2 (sample, original_code) or MNE Nx3 (sample, previous, code)."""
-    array = np.asarray(events)
-    if array.ndim != 2 or array.shape[1] not in (2, 3):
-        raise ValueError("Events must be Nx2 sample/code or MNE Nx3")
-    try:
-        numeric = array.astype(np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Events must contain integer samples and original numeric codes") from exc
-    if not np.all(np.isfinite(numeric)) or np.any(numeric != np.floor(numeric)):
-        raise ValueError("Events must contain finite integer values")
-    pairs = numeric[:, (0, array.shape[1] - 1)].astype(np.int64)
-    if np.any(pairs[:, 0] < 0):
-        raise ValueError("Event sample positions must be nonnegative")
-    return pairs[np.argsort(pairs[:, 0], kind="stable")]
-
-
-def _label_vector(labels) -> np.ndarray:
-    vector = np.asarray(labels)
-    if vector.ndim not in (1, 2) or (vector.ndim == 2 and 1 not in vector.shape):
-        raise ValueError("classlabel must be a row or column vector")
-    try:
-        values = vector.reshape(-1).astype(np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("classlabel must contain numeric classes 1..4") from exc
-    if not np.all(np.isfinite(values)) or np.any(~np.isin(values, (1, 2, 3, 4))):
-        raise ValueError("classlabel must contain integer classes 1..4")
-    return values.astype(np.int64)
-
-
-def index_trials(events, subject_id: str, session_id: str, labels=None, strict: bool = True) -> list[Trial]:
-    """Index every cue chronologically, attaching truth BEFORE any filtering.
-
-    ``events`` is Nx2 (sample, original_code) or MNE Nx3. Calibration runs without
-    768/MI cues do not count as task runs. Run IDs are 1-based task run indices.
-    Unknown 783 cues are allowed in E without labels; never guessed as rest.
-    ``strict=False`` relaxes only dataset-size/run-count/class-balance checks,
-    permitting small fixtures, while preserving alignment and structure checks.
-    """
-    session_id = session_id.upper()
-    if session_id not in ("T", "E"):
-        raise ValueError("Session must be T or E")
-    pairs = _event_pairs(events)
-    starts = pairs[pairs[:, 1] == 768, 0]
-    cues = pairs[np.isin(pairs[:, 1], CUE_CODES)]
-    run_starts = pairs[pairs[:, 1] == 32766, 0]
-    artifacts = pairs[pairs[:, 1] == 1023, 0]
-    if len(cues) == 0 or len(starts) != len(cues):
-        raise ValueError("Each 768 trial start must have exactly one cue")
-    if len(np.unique(starts)) != len(starts) or len(np.unique(cues[:, 0])) != len(cues):
-        raise ValueError("Duplicate trial start or cue sample")
-    if len(np.unique(run_starts)) != len(run_starts):
-        raise ValueError("Duplicate run start sample")
-    if len(run_starts) == 0:
-        if strict:
-            raise ValueError("No run boundary events (32766)")
-        run_starts = np.array([0], dtype=np.int64)
-    if starts[0] < run_starts[0]:
-        raise ValueError("Trial occurs before first run boundary")
-    aligned_labels = None if labels is None else _label_vector(labels)
-    if aligned_labels is not None and len(aligned_labels) != len(cues):
-        raise ValueError(f"Label count {len(aligned_labels)} != cue count {len(cues)}; labels must include every trial")
-    assigned_runs = np.searchsorted(run_starts, starts, side="right") - 1
-    task_runs = sorted(set(assigned_runs.tolist()))
-    run_ids = {raw_run: index + 1 for index, raw_run in enumerate(task_runs)}
-    trials = []
-    for index, (start, (cue, code)) in enumerate(zip(starts, cues)):
-        next_start = int(starts[index + 1]) if index + 1 < len(starts) else np.inf
-        raw_run = int(assigned_runs[index])
-        next_run = int(run_starts[raw_run + 1]) if raw_run + 1 < len(run_starts) else np.inf
-        stop = min(next_start, next_run)
-        if not start <= cue < stop:
-            raise ValueError(f"Trial {index + 1} has missing, duplicate, or out-of-run cue")
-        original_class = int(code - 768) if code != 783 else None
-        if aligned_labels is not None:
-            truth = int(aligned_labels[index])
-            if original_class is not None and truth != original_class:
-                raise ValueError(f"Label/cue mismatch at trial {index + 1}, including artifact-marked trials")
-            original_class = truth
-        if session_id == "T" and original_class is None:
-            raise ValueError("Training session contains an unknown class")
-        trials.append(Trial(
-            subject_id=subject_id, session_id=session_id, run_id=run_ids[raw_run],
-            trial_id=f"{subject_id}{session_id}-{index + 1:03d}", cue_sample=int(cue),
-            original_class=original_class,
-            artifact_flag=bool(np.any((artifacts >= start) & (artifacts < stop))),
-            start_sample=int(start),
-        ))
-    if strict:
-        if len(trials) != 288:
-            raise ValueError(f"Dataset 2a requires 288 trials; found {len(trials)}")
-        if len(task_runs) != 6:
-            raise ValueError(f"Dataset 2a requires 6 task runs; found {len(task_runs)}")
-        for run_id in range(1, 7):
-            members = [t for t in trials if t.run_id == run_id]
-            if len(members) != 48:
-                raise ValueError(f"Run {run_id} requires 48 trials; found {len(members)}")
-            known = [t.original_class for t in members if t.original_class is not None]
-            counts = {cls: known.count(cls) for cls in (1, 2, 3, 4)}
-            if any(count > 12 for count in counts.values()) or (len(known) == 48 and any(count != 12 for count in counts.values())):
-                raise ValueError(f"Run {run_id} requires 12 trials per class; found {counts}")
-    return trials
-
-
-def load_labels(path) -> np.ndarray:
-    """Read official MATLAB ``classlabel`` without truncating or filtering it."""
-    from scipy.io import loadmat
-    contents = loadmat(Path(path))
-    if "classlabel" not in contents:
-        raise ValueError("MAT label file has no classlabel variable")
-    return _label_vector(contents["classlabel"])
-
-
-def _normalize_gdf_missing(data: np.ndarray, extras: dict) -> tuple[np.ndarray, str]:
-    """Keep missing/saturated lower-bound samples invalid before filtering.
-
-    MNE calibrates GDF as ``(digital * cal + offsets) * units``. Its modern
-    reader removes digital_min after constructing cal; in that case the
-    signed storage dtype's minimum is used. Negative digital_max is also
-    checked because BioSig reserves negative full-scale values for overflow.
-    Any channel at/below that boundary invalidates the entire sample. This
-    intentionally treats negative saturation as unusable data too. Unknown
-    calibration layouts raise, rather than guessing zeros or signal units.
-    """
-    result = np.array(data, dtype=np.float64, copy=True)
-    count = result.shape[0]
-    try:
-        cal = np.broadcast_to(np.asarray(extras["cal"], dtype=float), (count,))
-        offset = np.broadcast_to(np.asarray(extras["offsets"], dtype=float), (count,))
-        unit = np.broadcast_to(np.asarray(extras["units"], dtype=float), (count,))
-        if "digital_min" in extras:
-            digital_min = np.broadcast_to(np.asarray(extras["digital_min"], dtype=float), (count,))
-        else:
-            dtype = np.dtype(extras["dtype_np"])
-            if dtype.kind == "i":
-                digital_min = np.full(count, np.iinfo(dtype).min, dtype=float)
-            elif "digital_max" in extras:
-                # GDF also permits float storage of digital full-scale values.
-                digital_min = -np.abs(np.asarray(extras["digital_max"], dtype=float))
-            else:
-                raise ValueError("GDF storage has no recoverable negative digital full scale")
-        if "digital_max" in extras:
-            digital_min = np.maximum(digital_min, -np.abs(np.asarray(extras["digital_max"], dtype=float)))
-        if np.any(cal <= 0) or np.any(unit <= 0) or np.any(digital_min >= 0):
-            raise ValueError("Invalid GDF calibration")
-        boundary = (digital_min * cal + offset) * unit
-        tolerance = np.abs(cal * unit) * 0.25
-        if not np.all(np.isfinite(boundary)):
-            raise ValueError("Nonfinite GDF calibration")
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("Cannot identify GDF missing-value sentinel from MNE calibration metadata; import aborted") from exc
-    invalid = np.any(~np.isfinite(result) | (result <= (boundary + tolerance)[:, None]), axis=0)
-    result[:, invalid] = np.nan
-    return result, "calibrated negative digital full-scale; lower-bound saturation also invalid"
-
-
-def load_gdf(path, labels_path=None, strict: bool = True) -> Recording:
-    """Load a standard AxxT/AxxE GDF, retaining all 4 classes and time samples.
-
-    The official channel order is 22 EEG then 3 EOG. Numeric annotation strings
-    are mapped explicitly rather than relying on MNE's generated event IDs.
-    GDF support is exercised with fixtures; real files are not bundled.
-    """
-    import mne
-    path = Path(path)
-    match = re.fullmatch(r"(A\d{2})([TE])", path.stem, flags=re.IGNORECASE)
-    if not match:
-        raise ValueError("Expected Dataset 2a filename AxxT.gdf or AxxE.gdf")
-    subject_id, session_id = (value.upper() for value in match.groups())
-    raw = mne.io.read_raw_gdf(path, eog=[22, 23, 24], stim_channel=None, preload=True, verbose="ERROR")
-    if len(raw.ch_names) != 25 or not np.isclose(raw.info["sfreq"], 250.0):
-        raise ValueError("Dataset 2a requires exactly 25 channels at 250 Hz")
-    descriptions = set(raw.annotations.description)
-    mapped = {name: value for name, value in EVENT_ID.items() if name in descriptions}
-    if not any(str(code) in mapped for code in CUE_CODES):
-        raise ValueError("No recognized numeric GDF cue annotations; refusing implicit event mapping")
-    events, _ = mne.events_from_annotations(raw, event_id=mapped, verbose="ERROR")
-    events[:, 0] -= raw.first_samp
-    labels = None if labels_path is None else load_labels(labels_path)
-    trials = index_trials(events, subject_id, session_id, labels=labels, strict=strict)
-    extras = raw._raw_extras[0]
-    if "n_samps" in extras and len(set(np.asarray(extras["n_samps"]).tolist())) != 1:
-        raise ValueError("Mixed channel sampling rates are not accepted for Dataset 2a")
-    data, missing_method = _normalize_gdf_missing(raw.get_data(), extras)
-    return Recording(
-        data=data[:22], timestamps=np.arange(data.shape[1]) / 250.0,
-        info=StreamInfo(250.0, EEG_CHANNELS), trials=trials,
-        run_starts=sorted(set(int(x) for x in events[events[:, 2] == 32766, 0])),
-        subject_id=subject_id, session_id=session_id, eog=data[22:25],
-        metadata={"source": "BCI Competition IV Dataset 2a", "synthetic": False,
-                  "source_file": path.name, "original_channel_names": list(raw.ch_names),
-                  "eog_channel_names": list(raw.ch_names[22:]),
-                  "labels_file": None if labels_path is None else Path(labels_path).name,
-                  "missing_value_policy": missing_method,
-                  "missing_samples": int(np.any(~np.isfinite(data), axis=0).sum()),
-                  "strict_validation": bool(strict)},
-    )
 
 
 def save_recording(path, recording: Recording) -> None:
@@ -513,16 +328,14 @@ def save_recording(path, recording: Recording) -> None:
     }
     arrays = {"data": recording.data, "timestamps": recording.timestamps,
               "metadata_json": np.asarray(json.dumps(payload, ensure_ascii=False, allow_nan=False))}
-    if recording.eog is not None:
-        arrays["eog"] = recording.eog
     with path.open("wb") as file:
         np.savez_compressed(file, **arrays)
 
 
 def load_recording(path) -> Recording:
     path = Path(path)
-    if path.suffix.lower() == ".gdf":
-        return load_gdf(path)
+    if path.suffix.lower() != ".npz":
+        raise ValueError("Expected a personal recording NPZ created by import-session")
     with np.load(path, allow_pickle=False) as arrays:
         payload = json.loads(str(arrays["metadata_json"].item()))
         if payload.get("format_version") != 1:
@@ -533,76 +346,13 @@ def load_recording(path) -> Recording:
             data=arrays["data"], timestamps=arrays["timestamps"], info=StreamInfo(**info),
             trials=[Trial(**trial) for trial in payload["trials"]],
             run_starts=payload["run_starts"], subject_id=payload["subject_id"],
-            session_id=payload["session_id"], eog=arrays["eog"] if "eog" in arrays else None,
+            session_id=payload["session_id"],
             metadata=payload.get("metadata", {}),
         )
 
 
 # ========================================================================
-# 05. 合成演示数据
-# ========================================================================
-
-def make_synthetic_recording(session_id="T", subject_id="SYN01", runs=3, trials_per_run=8, seed=42) -> Recording:
-    """Create balanced 4-class runs with fixed spatial patterns and session noise.
-
-    Each trial is 8 seconds: cue at +2 seconds, imagery for 4 seconds. A 100
-    sample NaN gap separates runs. The known artificial class-dependent power
-    makes this a pipeline demonstration, not an estimate of human MI accuracy.
-    """
-    session_id = str(session_id).upper()
-    if session_id not in ("T", "E"):
-        raise ValueError("Session must be T or E")
-    if runs < 1 or int(runs) != runs or trials_per_run < 4 or int(trials_per_run) != trials_per_run or trials_per_run % 4:
-        raise ValueError("Use positive integer runs and trials_per_run divisible by 4")
-    runs, trials_per_run = int(runs), int(trials_per_run)
-    sfreq, trial_samples, gap_samples, lead_samples = 250, 2000, 100, 500
-    run_samples = lead_samples + trials_per_run * trial_samples
-    sample_count = runs * run_samples + (runs - 1) * gap_samples
-    rng = np.random.default_rng(np.random.SeedSequence([int(seed), 0 if session_id == "T" else 1]))
-    times = np.arange(sample_count) / sfreq
-    # Independent background plus a shared low-frequency drift and line noise.
-    data = rng.normal(0, 4e-6, (len(EEG_CHANNELS), sample_count))
-    data += rng.normal(0, 1e-6, (1, sample_count))
-    data += 3e-6 * np.sin(2 * np.pi * 1.3 * times)[None, :]
-    data += 0.4e-6 * np.sin(2 * np.pi * 50 * times)[None, :]
-    eog = rng.normal(0, 7e-6, (3, sample_count))
-    # Shared patterns are tied to electrode positions, not random session seed.
-    left = np.array([0.05, .4, .25, .1, 0, 0, .65, 1, .6, .1, 0, 0, 0, .5, .3, .1, 0, 0, .05, 0, 0, 0])
-    right = np.array([0.05, 0, 0, .1, .25, .4, 0, 0, 0, .1, .6, 1, .65, 0, 0, .1, .3, .5, 0, 0, .05, 0])
-    middle = np.array([.3, .1, .3, .6, .3, .1, .05, .15, .5, 1, .5, .15, .05, .1, .3, .6, .3, .1, .2, .5, .2, .1])
-    posterior = np.array([0, 0, 0, 0, 0, 0, .1, .1, .1, .2, .1, .1, .1, .3, .4, .5, .4, .3, .6, 1, .6, .8])
-    trials, run_starts = [], []
-    for run in range(runs):
-        run_start = run * (run_samples + gap_samples)
-        run_starts.append(run_start)
-        if run:
-            data[:, run_start - gap_samples:run_start] = np.nan
-            eog[:, run_start - gap_samples:run_start] = np.nan
-        classes = rng.permutation(np.tile(np.arange(1, 5), trials_per_run // 4))
-        for ordinal, cls in enumerate(classes):
-            start = run_start + lead_samples + ordinal * trial_samples
-            cue = start + 2 * sfreq
-            mi = slice(cue, cue + 4 * sfreq)
-            phase = rng.uniform(0, 2 * np.pi, 4)
-            t = np.arange(4 * sfreq) / sfreq
-            envelope = np.minimum(1, t / .15) * np.minimum(1, (4 - t) / .15)
-            # Contralateral mu suppression: left imagery lowers right-side mu.
-            amplitudes = {1: (13, 3, 3, 2), 2: (3, 13, 3, 2), 3: (6, 6, 13, 2), 4: (6, 6, 3, 13)}[int(cls)]
-            for pattern, amplitude, frequency, offset in zip((left, right, middle, posterior), amplitudes, (11, 12, 18, 23), phase):
-                oscillation = np.sin(2 * np.pi * (frequency + rng.normal(0, .15)) * t + offset)
-                data[:, mi] += pattern[:, None] * (amplitude * 1e-6 * rng.uniform(.85, 1.15)) * oscillation * envelope
-            trials.append(Trial(str(subject_id), session_id, run + 1,
-                                f"{subject_id}{session_id}-{len(trials) + 1:03d}", cue,
-                                int(cls), False, start))
-    return Recording(data, times, StreamInfo(float(sfreq), EEG_CHANNELS), trials, run_starts,
-                     str(subject_id), session_id, eog=eog,
-                     metadata={"source": "synthetic engineering demonstration", "synthetic": True,
-                               "seed": int(seed), "runs": runs, "trials_per_run": trials_per_run,
-                               "description": "Artificial spatial oscillatory classes; not recorded EEG or real participant results"})
-
-
-# ========================================================================
-# 06. 因果预处理
+# 05. 因果预处理
 # ========================================================================
 
 @dataclass(frozen=True)
@@ -708,7 +458,7 @@ class CausalPreprocessor:
 
 
 # ========================================================================
-# 07. 环形缓冲
+# 06. 环形缓冲
 # ========================================================================
 
 @dataclass(frozen=True)
@@ -769,7 +519,7 @@ class RingBuffer:
 
 
 # ========================================================================
-# 08. 指令判决
+# 07. 指令判决
 # ========================================================================
 
 class DecisionPolicy:
@@ -837,7 +587,7 @@ class DecisionPolicy:
 
 
 # ========================================================================
-# 09. 流式解码与状态机
+# 08. 流式解码与状态机
 # ========================================================================
 
 NEUTRAL_MARKERS = frozenset({"RUN_START", "TRIAL_START", "MI_START", "MI_END", "DISCONNECT", "SESSION_END"})
@@ -850,12 +600,15 @@ def iter_window_starts(config: Config, cue_sample: int):
 
 
 class Runtime:
-    def __init__(self, config: Config, model, sos=None, model_version="unversioned", window_observer=None):
+    def __init__(self, config: Config, model, sos=None, model_version="unversioned", window_observer=None,
+                 validity_guard=None):
         self.config, self.model, self.model_version = config, model, model_version
         self.preprocessor = CausalPreprocessor(config, sos)
         self.buffer = RingBuffer(len(config.channels), config.samples(config.buffer_seconds))
         self.decision = DecisionPolicy(config)
         self.window_observer = window_observer
+        self.validity_guard = validity_guard
+        self.quality_limits = QualityThresholds.for_window(config)
         self.trial_id = None
         self._active = False
         self._starts = []
@@ -868,6 +621,7 @@ class Runtime:
         self.stats = {"samples_processed": 0, "continuity_resets": 0,
                       "bad_signal_samples": 0, "stale_samples": 0,
                       "invalid_windows": 0, "model_errors": 0}
+        self.stats["channel_rejected_windows"] = {name: 0 for name in config.channels}
 
     def process(self, event: EEGChunk | Marker) -> list[Prediction | Command]:
         if isinstance(event, Marker):
@@ -913,11 +667,19 @@ class Runtime:
         window = self.buffer.read(start, stop)
         quality = "OK"
         probabilities = None
+        channel_reasons = {}
+        if window is not None:
+            channel_reasons = {row["channel"]: row["reasons"] for row in channel_quality_report(
+                window.raw_data, self.config.sfreq, self.config.channels, self.quality_limits) if row["reasons"]}
+            for name in channel_reasons:
+                self.stats["channel_rejected_windows"][name] += 1
         if window is None:
             quality = "INSUFFICIENT_DATA"
         elif np.any(window.reasons == "STALE_DATA"):
             quality = "STALE_DATA"
         elif not window.valid.all() or np.any(window.epochs != window.epochs[0]):
+            quality = "BAD_SIGNAL"
+        elif channel_reasons:
             quality = "BAD_SIGNAL"
         elif (not np.isfinite(window.data).all()
               or np.any(np.std(window.data, axis=1) <= self.config.flat_std_volts)
@@ -938,7 +700,12 @@ class Runtime:
                     or abs(window.timestamps[-1] - expected_last) > tolerance):
                 quality = "BAD_SIGNAL"
         if quality == "OK":
-            timestamp = float(window.timestamps[-1]) + 1.0 / self.config.sfreq
+            # Freshness uses the last observed EEG sample. stop_sample remains
+            # exclusive, but its following sample time has not been observed yet.
+            timestamp = float(window.timestamps[-1])
+            if self.validity_guard is not None:
+                quality = self.validity_guard(self.trial_id, timestamp) or "OK"
+        if quality == "OK":
             try:
                 p = np.asarray(self.model.predict_proba(window.data[np.newaxis]), dtype=float)
                 if p.shape != (1, 2) or not np.isfinite(p).all() or np.any(p < 0) or np.any(p > 1) or not np.isclose(p.sum(), 1):
@@ -946,8 +713,15 @@ class Runtime:
                 probabilities = tuple(float(x) for x in p[0])
             except Exception:
                 quality = "MODEL_ERROR"
+        # Inference may have outlived the input, cue or connection. The guard reads
+        # acquisition state directly, never the decoder's possibly backlogged queue.
+        if quality == "OK" and self.validity_guard is not None:
+            quality = self.validity_guard(self.trial_id, timestamp) or "OK"
+            if quality != "OK":
+                probabilities = None
         prediction = Prediction(self.trial_id, start, stop, probabilities, timestamp,
-                                self.model_version, quality, perf_counter() - began)
+                                self.model_version, quality, perf_counter() - began,
+                                tuple(channel_reasons), channel_reasons)
         if quality != "OK":
             self.stats["invalid_windows"] += 1
         if quality == "MODEL_ERROR":
@@ -991,13 +765,15 @@ class Runtime:
             self._cue_timestamp = None
             return outputs
         if marker.kind == "DISCONNECT":
+            outputs = self._flush(marker.timestamp)
             self.preprocessor.reset()
             self.buffer.clear()
             self._epoch += 1
-            self.decision.clear_streak()
-            return [Command(self.trial_id, "NO_COMMAND", marker.sample,
+            self._active = False
+            self.decision.end()
+            return outputs + [Command(self.trial_id, "NO_COMMAND", marker.sample,
                             marker.timestamp if marker.timestamp is not None else self._safe_timestamp(marker.sample),
-                            "STALE_DATA")]
+                            "SIGNAL_LOST")]
         if marker.kind == "SESSION_END":
             return self.finish()
         if marker.kind == "TRIAL_START":
@@ -1036,7 +812,9 @@ class Runtime:
         outputs = self._flush(marker.timestamp)
         self._active = False
         self.decision.end()
-        return outputs
+        return outputs + [Command(self.trial_id, "NO_COMMAND", marker.sample,
+                                 marker.timestamp if marker.timestamp is not None else self._safe_timestamp(marker.sample),
+                                 "MI_ENDED")]
 
     def finish(self):
         outputs = self._flush()
@@ -1046,7 +824,7 @@ class Runtime:
 
 
 # ========================================================================
-# 10. 连续回放
+# 09. 连续回放
 # ========================================================================
 
 class ReplaySource:
@@ -1117,7 +895,7 @@ class ReplaySource:
 
 
 # ========================================================================
-# 11. LSL 设备采集
+# 10. LSL 设备采集
 # ========================================================================
 
 UNIT_SCALE = {"V": 1.0, "mV": 1e-3, "uV": 1e-6, "µV": 1e-6, "μV": 1e-6}
@@ -1145,7 +923,7 @@ class LiveSource:
         try:
             import pylsl
         except ImportError as exc:
-            raise RuntimeError("Install the live extra: pip install -e .[live]") from exc
+            raise RuntimeError("Install pylsl: python -m pip install pylsl; also ensure liblsl is available") from exc
         if reference != config.reference:
             raise ValueError("Device reference must match the frozen model; recalibrate after changing reference")
         if units and config.lsl_input_units and UNIT_SCALE.get(units) != UNIT_SCALE[config.lsl_input_units]:
@@ -1153,8 +931,11 @@ class LiveSource:
         units = units or config.lsl_input_units
         self.config = config
         self.clock = pylsl.local_clock
-        self.info = StreamInfo(config.sfreq, config.channels, "V", reference)
+        self.info = StreamInfo(config.sfreq, config.channels, reference=reference)
         self._stop = threading.Event()
+        self.safety = LiveSafety(config, self.clock, self._stop)
+        self.timing_records = []
+        self.pending_raw = []
         self._state_lock = threading.Lock()
         self._iterator_active = False
         self.eeg = None
@@ -1215,13 +996,34 @@ class LiveSource:
                 self._close_inlets()
 
     def _close_inlets(self):
+        failures = []
         for name in ("eeg", "markers"):
             inlet = getattr(self, name, None)
             if inlet is not None:
                 try:
                     inlet.close_stream()
+                except BaseException as exc:
+                    failures.append((name, exc))
                 finally:
                     setattr(self, name, None)
+        if failures:
+            details = "; ".join(f"{name}: {type(exc).__name__}: {exc}" for name, exc in failures)
+            raise RuntimeError(f"LSL inlet cleanup failed: {details}") from failures[0][1]
+
+    def _released_eeg(self, values, times, index, segment):
+        """Remove yielded samples from the small raw holdback recovery queue."""
+        count = len(times)
+        while count:
+            packet = self.pending_raw[0]
+            used = min(count, len(packet.timestamps))
+            count -= used
+            if used == len(packet.timestamps):
+                self.pending_raw.pop(0)
+            else:
+                self.pending_raw[0] = replace(packet, data=packet.data[:, used:],
+                                              timestamps=packet.timestamps[used:],
+                                              start_sample=packet.start_sample + used)
+        return EEGChunk(values, times, index, self.info, segment, self.clock())
 
     def __iter__(self):
         with self._state_lock:
@@ -1236,9 +1038,25 @@ class LiveSource:
         segment = 0
         last_data = self.clock()
         previous_end = None
+        read_index = 0
+        last_received_stamp = None
         try:
             while not self._stop.is_set():
                 samples, stamps = self.eeg.pull_chunk(timeout=0.1, max_samples=self.config.chunk_samples)
+                # Remember received samples before marker parsing, including data
+                # from the pull which exposes a malformed/late marker.
+                if stamps:
+                    last_data = self.clock()
+                    times = np.asarray(stamps, dtype=float)
+                    values = np.asarray(samples, dtype=float).T[self.order] * self.scales
+                    self.pending_raw.append(EEGChunk(values, times, read_index, self.info, segment, last_data))
+                    read_index += len(times)
+                    if (not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0)
+                            or (last_received_stamp is not None and times[0] <= last_received_stamp)):
+                        raise RuntimeError("EEG timestamps must be finite and strictly increasing across chunks")
+                    last_received_stamp = float(times[-1])
+                    self.safety.eeg(times[-1])
+                    buffered.append((values, times, last_data))
                 # Consume all available markers before advancing the EEG timeline.
                 while True:
                     payload, stamp = self.markers.pull_sample(timeout=0.0)
@@ -1246,14 +1064,15 @@ class LiveSource:
                         break
                     if not np.isfinite(stamp):
                         raise ValueError("Marker timestamp must be finite")
-                    pending.append((float(stamp), parse_neutral_marker(payload[0])))
-                if stamps:
-                    last_data = self.clock()
-                    times = np.asarray(stamps, dtype=float)
-                    values = np.asarray(samples, dtype=float).T[self.order] * self.scales
-                    if not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0):
-                        raise RuntimeError("EEG timestamps must be finite and strictly increasing")
-                    buffered.append((values, times, last_data))
+                    event = parse_neutral_marker(payload[0])
+                    received = self.clock()
+                    if stamp - received > self.config.timestamp_tolerance_seconds:
+                        raise RuntimeError("Marker clock is ahead of the receiver clock")
+                    self.safety.marker(event["kind"], event.get("trial_id"), float(stamp))
+                    self.timing_records.append({"kind": event["kind"], "trial_id": event.get("trial_id"),
+                                                "timestamp": float(stamp), "received_at": received,
+                                                "transport_age_seconds": received - float(stamp)})
+                    pending.append((float(stamp), event, received))
                 # Hold EEG briefly so independently transported phase markers can catch up.
                 # Timestamps stay untouched; data age still includes this bounded holdback.
                 pending.sort(key=lambda pair: pair[0])
@@ -1261,27 +1080,33 @@ class LiveSource:
                     values, times, _ = buffered.pop(0)
                     position = 0
                     while pending and pending[0][0] <= times[-1] + 1 / self.config.sfreq:
-                        stamp, event = pending.pop(0)
+                        stamp, event, received = pending.pop(0)
                         if previous_end is not None and stamp <= previous_end:
                             raise RuntimeError("Late marker arrived after its EEG was decoded; stopping to preserve causal alignment")
                         boundary = int(np.searchsorted(times, stamp, side="left"))
                         if boundary > position:
-                            yield EEGChunk(values[:, position:boundary], times[position:boundary], index + position, self.info, segment, self.clock())
+                            yield self._released_eeg(values[:, position:boundary], times[position:boundary], index + position, segment)
                         if event["kind"] in {"RUN_START", "DISCONNECT"}:
                             segment += 1
-                        yield Marker(event["kind"], index + boundary, event.get("trial_id"), stamp, segment)
+                        alignment = float(times[boundary] - stamp) if boundary < len(times) else None
+                        yield Marker(event["kind"], index + boundary, event.get("trial_id"), stamp, segment,
+                                     received, alignment)
                         if event["kind"] == "SESSION_END":
                             return
                         if event["kind"] == "DISCONNECT":
-                            raise RuntimeError("Paradigm aborted; this session is incomplete")
+                            raise RuntimeError("External experiment aborted; this session is incomplete")
                         position = boundary
                     if position < len(times):
-                        yield EEGChunk(values[:, position:], times[position:], index + position, self.info, segment, self.clock())
+                        yield self._released_eeg(values[:, position:], times[position:], index + position, segment)
                     index += len(times)
                     previous_end = float(times[-1])
                 if not stamps and self.clock() - last_data > 1.0:
+                    self.safety.fail("SIGNAL_LOST")
                     yield Marker("DISCONNECT", index, timestamp=self.clock(), segment_id=segment)
                     raise RuntimeError("No EEG for one second; restart source after reconnecting")
+        except BaseException:
+            self.safety.fail("ACQUISITION_FAILED")
+            raise
         finally:
             with self._state_lock:
                 self._iterator_active = False
@@ -1289,7 +1114,7 @@ class LiveSource:
 
 
 # ========================================================================
-# 12. 异步记录
+# 11. 异步记录
 # ========================================================================
 
 def json_value(value):
@@ -1305,7 +1130,17 @@ def json_value(value):
 
 
 def write_json(path, value):
-    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2, default=json_value, allow_nan=False), encoding="utf-8")
+    """Replace metadata only after a complete UTF-8 serialization and file write."""
+    path = Path(path)
+    encoded = json.dumps(value, ensure_ascii=False, indent=2, default=json_value, allow_nan=False)
+    temporary = path.with_name(path.name + "." + uuid4().hex + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class AsyncRecorder:
@@ -1319,12 +1154,14 @@ class AsyncRecorder:
         self.error = None
         self.max_backlog = 0
         self.raw_samples = 0
+        self.processed_raw_samples = 0
+        self.accepted_raw_samples = 0
         self.closed = False
         self.thread = threading.Thread(target=self._worker, name="mi-recorder", daemon=True)
         write_json(self.directory / "manifest.json", {"format": "mi-bci-session-v1", "status": "recording", "stream": info, "raw_layout": "sample-major little-endian float64, raw_eeg.f64 and timestamps.f64; chunk offsets in chunks.jsonl"})
         self.thread.start()
 
-    def record(self, item):
+    def record(self, item, timeout=0):
         if self.closed:
             raise RuntimeError("Recorder already closed")
         if self.error:
@@ -1333,10 +1170,12 @@ class AsyncRecorder:
             # Sources are free to reuse their acquisition buffers.
             item = EEGChunk(item.data.copy(), item.timestamps.copy(), item.start_sample, item.info, item.segment_id, item.received_at)
         try:
-            self.queue.put_nowait(item)
+            self.queue.put(item, block=bool(timeout), timeout=timeout if timeout else None)
         except queue.Full as exc:
             raise RuntimeError("Recorder backlog full; session stopped to prevent silent loss") from exc
         self.max_backlog = max(self.max_backlog, self.queue.qsize())
+        if isinstance(item, EEGChunk):
+            self.accepted_raw_samples += item.data.shape[1]
 
     def _worker(self):
         try:
@@ -1350,8 +1189,10 @@ class AsyncRecorder:
                             n = item.data.shape[1]
                             raw.write(np.asarray(item.data.T, dtype="<f8").tobytes())
                             stamps.write(np.asarray(item.timestamps, dtype="<f8").tobytes())
-                            chunks.write(json.dumps({"offset_samples": self.raw_samples, "count": n, "start_sample": item.start_sample, "segment_id": item.segment_id, "received_at": item.received_at}) + "\n")
-                            self.raw_samples += n
+                            chunks.write(json.dumps({"offset_samples": self.processed_raw_samples, "count": n, "start_sample": item.start_sample, "segment_id": item.segment_id, "received_at": item.received_at}) + "\n")
+                            # Python buffered writes are not proof of retained bytes.
+                            # raw_samples is confirmed from the closed files below.
+                            self.processed_raw_samples += n
                         else:
                             events.write(json.dumps(item, ensure_ascii=False, default=json_value, allow_nan=False) + "\n")
                     finally:
@@ -1359,14 +1200,66 @@ class AsyncRecorder:
         except BaseException as exc:
             self.error = exc
 
-    def close(self, status="complete", error=None):
+    def _confirm_raw_storage(self):
+        """Confirm the common closed-file prefix, without claiming power-loss durability."""
+        result = {"status": "unconfirmed", "confirmed_prefix_samples": 0,
+                  "raw_file_samples": None, "timestamp_file_samples": None, "issues": [],
+                  "scope": "Closed-file byte lengths plus complete contiguous chunk-index rows; no fsync/power-loss durability claim."}
+        if self.thread.is_alive():
+            result["issues"].append("RECORDER_THREAD_STILL_RUNNING")
+            return result
+        try:
+            raw_bytes = (self.directory / "raw_eeg.f64").stat().st_size
+            stamp_bytes = (self.directory / "timestamps.f64").stat().st_size
+            stride = len(self.info.channels) * 8
+            raw_count, stamp_count = raw_bytes // stride, stamp_bytes // 8
+            result.update({"raw_file_samples": raw_count, "timestamp_file_samples": stamp_count,
+                           "raw_trailing_bytes": raw_bytes % stride, "timestamp_trailing_bytes": stamp_bytes % 8})
+            if raw_bytes % stride or stamp_bytes % 8:
+                result["issues"].append("PARTIAL_SAMPLE_BYTES")
+            if raw_count != stamp_count:
+                result["issues"].append("RAW_TIMESTAMP_LENGTH_MISMATCH")
+            available = min(raw_count, stamp_count)
+            with (self.directory / "chunks.jsonl").open("rb") as stream:
+                for line_number, line in enumerate(stream, 1):
+                    if not line.endswith(b"\n"):
+                        result["issues"].append(f"INCOMPLETE_CHUNK_INDEX_LINE_{line_number}")
+                        break
+                    try:
+                        row = json.loads(line)
+                        offset, count = row["offset_samples"], row["count"]
+                        if (isinstance(offset, bool) or not isinstance(offset, int)
+                                or isinstance(count, bool) or not isinstance(count, int) or count <= 0
+                                or offset != result["confirmed_prefix_samples"]):
+                            raise ValueError("Noncontiguous or invalid chunk indices")
+                        if offset + count > available:
+                            result["issues"].append(f"CHUNK_INDEX_EXCEEDS_RETAINED_BYTES_AT_LINE_{line_number}")
+                            break
+                        result["confirmed_prefix_samples"] += count
+                    except (ValueError, KeyError, TypeError) as exc:
+                        result["issues"].append(f"INVALID_CHUNK_INDEX_LINE_{line_number}: {exc}")
+                        break
+            confirmed = result["confirmed_prefix_samples"]
+            result["raw_samples_without_confirmed_index"] = max(0, raw_count - confirmed)
+            result["timestamp_samples_without_confirmed_index"] = max(0, stamp_count - confirmed)
+            if confirmed != raw_count or confirmed != stamp_count:
+                result["issues"].append("SAMPLES_WITHOUT_CONFIRMED_CHUNK_INDEX")
+            if confirmed != self.accepted_raw_samples:
+                result["issues"].append("ACCEPTED_SAMPLES_NOT_FULLY_CONFIRMED")
+            result["status"] = "confirmed" if not result["issues"] else "partial_or_unconfirmed"
+        except BaseException as exc:
+            result["issues"].append(f"{type(exc).__name__}: {exc}")
+        return result
+
+    def close(self, status="complete", error=None, received_raw_samples=None):
         if self.closed:
             return
         self.closed = True
         deadline = time.monotonic() + 10
         while self.thread.is_alive():
             if time.monotonic() >= deadline:
-                self.error = RuntimeError("Recorder did not accept shutdown within 10 seconds")
+                if self.error is None:
+                    self.error = RuntimeError("Recorder did not accept shutdown within 10 seconds")
                 break
             try:
                 self.queue.put(None, timeout=0.1)
@@ -1375,11 +1268,25 @@ class AsyncRecorder:
                 continue
         self.thread.join(timeout=max(0, deadline - time.monotonic()))
         if self.thread.is_alive():
-            self.error = RuntimeError("Recorder did not finish within 10 seconds")
+            if self.error is None:
+                self.error = RuntimeError("Recorder did not finish within 10 seconds")
+        storage = self._confirm_raw_storage()
+        self.raw_samples = storage["confirmed_prefix_samples"]
+        if storage["status"] != "confirmed" and self.error is None:
+            self.error = RuntimeError("Recorded EEG storage could not be fully confirmed: " + "; ".join(storage["issues"]))
         write_json(self.directory / "manifest.json", {
             "format": "mi-bci-session-v1", "status": "failed" if self.error or error else status,
             "error": str(self.error or error) if self.error or error else None,
             "stream": self.info, "raw_samples": self.raw_samples, "max_recorder_backlog": self.max_backlog,
+            "processed_raw_samples": self.processed_raw_samples,
+            "unconfirmed_processed_samples": max(0, self.processed_raw_samples - self.raw_samples),
+            "storage_verification": storage,
+            "received_raw_samples": received_raw_samples,
+            "accepted_raw_samples": self.accepted_raw_samples,
+            "unwritten_accepted_samples": max(0, self.accepted_raw_samples - self.raw_samples),
+            "unconfirmed_accepted_samples": max(0, self.accepted_raw_samples - self.raw_samples),
+            "failed_to_retain_samples": max(0, received_raw_samples - self.accepted_raw_samples)
+                                        if received_raw_samples is not None else None,
             "raw_layout": "sample-major little-endian float64, raw_eeg.f64 and timestamps.f64; chunk offsets in chunks.jsonl",
         })
         if self.error:
@@ -1387,14 +1294,14 @@ class AsyncRecorder:
 
 
 # ========================================================================
-# 12a. 真人采集记录与独立标签合并
+# 11a. 真人采集记录与独立标签合并
 # ========================================================================
 
 def load_personal_session(directory, labels_path, *, subject_id=None, session_id=None) -> Recording:
     """Import a completed personal capture without changing its EEG timeline.
 
     Cue positions come exclusively from the recorder's neutral Marker.sample.
-    The paradigm's source clock can differ from the receiving LSL clock, so its
+    The external cue source's clock can differ from the receiving LSL clock, so its
     timestamps are never used to locate EEG samples. Truth joins by trial ID;
     the complete neutral event sequence must also agree with the truth log.
     """
@@ -1439,7 +1346,8 @@ def load_personal_session(directory, labels_path, *, subject_id=None, session_id
     if (subject_id is not None and subject_id != captured_subject) or (session_id is not None and session_id != captured_session):
         raise ValueError("Subject/session override conflicts with the original capture context")
     config_values = context.get("config")
-    if not isinstance(config_values, dict) or set(config_values) != {f.name for f in fields(Config)}:
+    if (not isinstance(config_values, dict) or not {"sfreq", "channels", "reference"}.issubset(config_values)
+            or set(config_values) - {f.name for f in fields(Config)}):
         raise ValueError("Capture context must contain the complete acquisition configuration")
     config = Config.from_dict(config_values)
     stream = manifest.get("stream")
@@ -1455,6 +1363,12 @@ def load_personal_session(directory, labels_path, *, subject_id=None, session_id
         raise ValueError("Capture configuration and recorded stream metadata disagree")
 
     count = integer(manifest.get("raw_samples"), "raw_samples", 1)
+    for name in ("received_raw_samples", "accepted_raw_samples"):
+        if integer(manifest.get(name), name) != count:
+            raise ValueError("Received, accepted and persisted sample counts must agree for a complete capture")
+    for name in ("unwritten_accepted_samples", "failed_to_retain_samples"):
+        if integer(manifest.get(name), name) != 0:
+            raise ValueError("Complete capture contains unretained or unwritten samples")
     raw_path, timestamp_path = directory / "raw_eeg.f64", directory / "timestamps.f64"
     if raw_path.stat().st_size != count * len(info.channels) * 8 or timestamp_path.stat().st_size != count * 8:
         raise ValueError("Raw EEG/timestamp file size disagrees with the recorder manifest")
@@ -1477,7 +1391,11 @@ def load_personal_session(directory, labels_path, *, subject_id=None, session_id
 
     allowed_phases = {"RUN_START", "TRIAL_START", "MI_START", "MI_END", "SESSION_END"}
     markers = []
-    for event in read_rows(directory / "events.jsonl"):
+    recorded_events = read_rows(directory / "events.jsonl")
+    if (sum(event.get("type") == "SessionEnd" for event in recorded_events) != 1
+            or not recorded_events or recorded_events[-1].get("type") != "SessionEnd"):
+        raise ValueError("Capture requires exactly one final successful SessionEnd record")
+    for event in recorded_events:
         event_type = event.get("type")
         if event_type == "Marker":
             if event.get("kind") not in allowed_phases:
@@ -1486,7 +1404,8 @@ def load_personal_session(directory, labels_path, *, subject_id=None, session_id
                 raise ValueError("Recorded neutral markers must not contain class labels")
             markers.append(event)
         elif event_type == "SessionEnd":
-            if event.get("error") or event.get("cancelled") or event.get("pending_acquisition_packets", 0) or event.get("cleanup_errors"):
+            if (event.get("error") or event.get("cancelled") or event.get("pending_acquisition_packets", 0)
+                    or event.get("failed_to_retain_samples", 0) or event.get("cleanup_errors")):
                 raise ValueError("Session ended with an error, cancellation, or unrecorded packets")
         elif event_type not in {"Prediction", "Command"}:
             raise ValueError("Unrecognized event in personal capture")
@@ -1561,7 +1480,7 @@ def load_personal_session(directory, labels_path, *, subject_id=None, session_id
 
     return Recording(data=data, timestamps=timestamps, info=info, trials=trials,
                      run_starts=run_starts, subject_id=captured_subject, session_id=captured_session,
-                     metadata={"source": "personal_lsl", "synthetic": False,
+                     metadata={"source": "personal_lsl",
                                "capture_directory": directory.name, "labels_file": labels_path.name,
                                "capture_context": context, "config": config.to_dict(),
                                "label_alignment": "Exact trial IDs and phase sequence; cue samples from received neutral markers",
@@ -1569,7 +1488,7 @@ def load_personal_session(directory, labels_path, *, subject_id=None, session_id
 
 
 # ========================================================================
-# 13. 冻结模型包
+# 12. 冻结模型包
 # ========================================================================
 
 CLASS_MAPPING = {"0": "LEFT", "1": "RIGHT"}
@@ -1598,6 +1517,10 @@ class ModelBundle:
     report: dict = field(default_factory=dict)
 
     def validate(self):
+        if self.metadata.get("synthetic") or self.metadata.get("recording_metadata", {}).get("synthetic"):
+            raise ValueError("Only recorded-EEG models are supported; legacy synthetic models are not accepted")
+        if self.metadata.get("recording_metadata", {}).get("source") != "personal_lsl":
+            raise ValueError("Model must be trained from a personal LSL calibration recording")
         # Reconstructing invokes every configuration invariant.
         Config.from_dict(self.config.to_dict())
         sos = np.asarray(self.sos, dtype=float)
@@ -1621,7 +1544,7 @@ class ModelBundle:
             raise ValueError("CSP channel/component dimensions differ from the frozen configuration")
         if getattr(lda, "n_features_in_", None) != self.config.n_components:
             raise ValueError("LDA feature count differs from the frozen CSP configuration")
-        if not self.metadata.get("training_subject") or not str(self.metadata.get("training_session", "")).upper().endswith("T"):
+        if not self.metadata.get("training_subject") or self.metadata.get("training_session") != "T":
             raise ValueError("Bundle must identify its training subject and T session")
         if self.metadata.get("class_mapping") != CLASS_MAPPING:
             raise ValueError("Unsupported class mapping")
@@ -1629,12 +1552,14 @@ class ModelBundle:
             raise ValueError("Unsupported filter initialization policy")
         if self.metadata.get("reference") != self.config.reference or self.metadata.get("warmup_seconds") != self.config.warmup_seconds:
             raise ValueError("Training metadata differs from the frozen reference/warmup configuration")
+        if self.metadata.get("window_quality_limits") != asdict(QualityThresholds.for_window(self.config)):
+            raise ValueError("Frozen channel-quality policy is missing or differs; retrain from calibration data")
 
     def save(self, path):
         """Save a directory containing manifest.json and model.joblib."""
         self.validate()
         path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
+        path.mkdir(parents=True, exist_ok=False)
         model_path = path / "model.joblib"
         temporary_model = path / "model.joblib.tmp"
         joblib.dump(self.model, temporary_model, compress=3)
@@ -1691,7 +1616,7 @@ def load_bundle(path):
 
 
 # ========================================================================
-# 14. 独立评估
+# 13. 独立评估
 # ========================================================================
 
 def _value(obj, key, default=None):
@@ -1723,18 +1648,37 @@ def _score(rows):
         "confusion_matrix": confusion_matrix(truth, pred, labels=[0, 1]).tolist() if truth else [[0, 0], [0, 0]],
         "confusion_labels": ["LEFT", "RIGHT"],
         "command_trials": len(emitted), "correct_command_trials": correct,
+        "wrong_command_trials": len(emitted) - correct,
         "command_accuracy": correct / len(emitted) if emitted else None,
         "coverage": len(emitted) / len(rows) if rows else None,
         "correct_command_fraction": correct / len(rows) if rows else None,
         "cue_to_command_seconds": _distribution([r["cue_to_command_seconds"] for r in emitted if r["cue_to_command_seconds"] is not None]),
         "invalid_command_timing_trials": sum(not r["command_in_phase"] for r in emitted),
         "command_processing_seconds": _distribution([r["command_processing_seconds"] for r in emitted]),
+        "cue_to_output_seconds": _distribution([r["cue_to_output_seconds"] for r in emitted
+                                                if r["cue_to_output_seconds"] is not None]),
+        "result_age_at_output_seconds": _distribution([r["result_age_seconds"] for r in emitted
+                                                       if r["result_age_seconds"] is not None]),
+        "commands_within_4_seconds": sum(r["cue_to_output_seconds"] is not None
+                                          and 0 <= r["cue_to_output_seconds"] <= 4 for r in emitted),
+        "valid_window_fraction": (sum(r["valid_windows"] for r in rows) /
+                                  sum(r["expected_windows"] for r in rows))
+                                 if any(r["expected_windows"] for r in rows) else None,
+        "expected_windows": sum(r["expected_windows"] for r in rows),
+        "missing_windows": sum(r["missing_windows"] for r in rows),
+        "output_timing_measurements_complete": bool(emitted) and all(r["output_timing_measured"] for r in emitted),
         "invalid_windows": sum(r["invalid_windows"] for r in rows),
         "invalid_window_reasons": dict(sum((Counter(r["invalid_window_reasons"]) for r in rows), Counter())),
     }
 
 
-def evaluate(trials, predictions, commands, sfreq=250.0, imagery_seconds=4.0):
+def _evaluation_parameters(config):
+    return {name: getattr(config, name) for name in (
+        "sfreq", "imagery_seconds", "window_seconds", "step_seconds", "cue_offset_seconds", "max_age_seconds")}
+
+
+def evaluate(trials, predictions, commands, *, sfreq, imagery_seconds=4.0,
+             window_seconds=2.0, step_seconds=0.2, cue_offset_seconds=0.5, max_age_seconds=0.5):
     """Score all target trials, keeping missing/rejected trials in denominators.
 
     Classification averages the valid window probabilities within each trial.
@@ -1743,9 +1687,32 @@ def evaluate(trials, predictions, commands, sfreq=250.0, imagery_seconds=4.0):
     clock speed. Software processing time is reported separately, as measured
     by the runtime; it is not a complete device/transport/display latency.
     """
-    if sfreq <= 0:
-        raise ValueError("sfreq must be positive")
+    if any(isinstance(v, bool) or not isinstance(v, Real) or not isfinite(v) or v <= 0
+           for v in (sfreq, imagery_seconds, window_seconds, step_seconds, max_age_seconds)):
+        raise ValueError("Evaluation rates and durations must be finite and positive")
+    if (isinstance(cue_offset_seconds, bool) or not isinstance(cue_offset_seconds, Real)
+            or not isfinite(cue_offset_seconds) or cue_offset_seconds < 0
+            or cue_offset_seconds + window_seconds > imagery_seconds):
+        raise ValueError("Evaluation window must fit in the imagery phase")
+    durations = (imagery_seconds, window_seconds, step_seconds, cue_offset_seconds)
+    if any(abs(v * sfreq - round(v * sfreq)) > 1e-8 for v in durations):
+        raise ValueError("Evaluation timing must map to integer samples")
+    window_samples, step_samples = round(window_seconds * sfreq), round(step_seconds * sfreq)
     trials, predictions, commands = list(trials), list(predictions), list(commands)
+    for item in [*predictions, *commands]:
+        for name in ("timestamp", "processing_seconds", "emitted_at", "cue_to_output_seconds", "result_age_seconds"):
+            value = _value(item, name)
+            if name in {"timestamp", "processing_seconds"} and value is None:
+                raise ValueError(f"Evaluation event requires {name}")
+            if value is not None and (isinstance(value, (bool, np.bool_))
+                                      or not isinstance(value, Real) or not isfinite(value)):
+                raise ValueError(f"Evaluation {name} must be a finite number or an explicitly missing measurement")
+        if _value(item, "processing_seconds", 0) < 0:
+            raise ValueError("Processing time cannot be negative")
+    if any(isinstance(_value(t, "original_class"), bool)
+           or not isinstance(_value(t, "original_class"), Integral)
+           or _value(t, "original_class") not in (1, 2) for t in trials):
+        raise ValueError("Scoring requires personal truth labels 1=LEFT or 2=RIGHT")
     ids = [_value(t, "trial_id") for t in trials]
     if len(ids) != len(set(ids)):
         raise ValueError("Trial identifiers must be unique for label alignment")
@@ -1755,22 +1722,29 @@ def evaluate(trials, predictions, commands, sfreq=250.0, imagery_seconds=4.0):
         pred_by[_value(p, "trial_id")].append(p)
     for command in commands:
         cmd_by[_value(command, "trial_id")].append(command)
-    target_rows, non_target_rows, unlabeled_rows = [], [], []
+    target_rows = []
     duplicate_commands = 0
     out_of_phase = 0
     for trial in trials:
         trial_id = _value(trial, "trial_id")
         cue_sample = int(_value(trial, "cue_sample"))
         phase_end = cue_sample + round(imagery_seconds * sfreq)
+        expected_starts = set(range(cue_sample + round(cue_offset_seconds * sfreq),
+                                    phase_end - window_samples + 1, step_samples))
+        expected_stops = {start + window_samples for start in expected_starts}
+        observed_starts = set()
         trial_predictions = sorted(pred_by[trial_id], key=lambda p: _value(p, "stop_sample", 0))
         valid = []
         invalid = Counter()
         for p in trial_predictions:
             quality = _value(p, "quality", "OK")
             probs = _value(p, "probabilities")
-            if not cue_sample <= _value(p, "start_sample") < _value(p, "stop_sample") <= phase_end:
-                invalid["OUTSIDE_MI_PHASE"] += 1
-                continue
+            start, stop = _value(p, "start_sample"), _value(p, "stop_sample")
+            if start not in expected_starts or stop != start + window_samples:
+                raise ValueError("Prediction window is outside the frozen window schedule")
+            if start in observed_starts:
+                raise ValueError("Duplicate prediction window in trial")
+            observed_starts.add(start)
             if quality != "OK" or probs is None:
                 invalid[quality if quality != "OK" else "MISSING_PROBABILITIES"] += 1
                 continue
@@ -1778,58 +1752,66 @@ def evaluate(trials, predictions, commands, sfreq=250.0, imagery_seconds=4.0):
             if probs.shape != (2,) or not np.isfinite(probs).all() or np.any(probs < 0) or not np.isclose(probs.sum(), 1):
                 raise ValueError("Invalid probability vector in evaluation")
             valid.append(probs)
+        missing_windows = len(expected_starts - observed_starts)
+        if missing_windows:
+            invalid["MISSING_WINDOW"] += missing_windows
         mean = np.mean(valid, axis=0) if valid else None
         direction_commands = sorted(
             [c for c in cmd_by[trial_id] if _value(c, "direction") in ("LEFT", "RIGHT")],
             key=lambda c: _value(c, "sample", 0))
         duplicate_commands += max(0, len(direction_commands) - 1)
+        def command_in_phase(command):
+            if _value(command, "sample") not in expected_stops:
+                return False
+            latency = _value(command, "cue_to_output_seconds")
+            age = _value(command, "result_age_seconds")
+            if latency is not None and (not isfinite(latency) or not 0 <= latency < imagery_seconds):
+                return False
+            if age is not None and (not isfinite(age) or not 0 <= age <= max_age_seconds):
+                return False
+            return True
         for command in direction_commands:
-            if not cue_sample <= _value(command, "sample") <= phase_end:
+            if not command_in_phase(command):
                 out_of_phase += 1
         first = direction_commands[0] if direction_commands else None
-        in_phase = bool(first and cue_sample <= _value(first, "sample") <= phase_end)
+        in_phase = bool(first and command_in_phase(first))
         original = _value(trial, "original_class")
         command_class = (0 if _value(first, "direction") == "LEFT" else 1) if first else None
         row = {
             "trial_id": trial_id, "run_id": _value(trial, "run_id"),
-            "original_class": original, "target_class": original - 1 if original in (1, 2) else None,
+            "original_class": original, "target_class": original - 1,
             "artifact_flag": bool(_value(trial, "artifact_flag", False)),
             "valid_windows": len(valid), "invalid_windows": sum(invalid.values()),
+            "expected_windows": len(expected_starts), "missing_windows": missing_windows,
             "invalid_window_reasons": dict(invalid),
             "mean_probabilities": mean.tolist() if mean is not None else None,
             "predicted_class": int(np.argmax(mean)) if mean is not None else None,
             "command_class": command_class,
             "command_in_phase": in_phase,
-            "command_correct": bool(in_phase and original in (1, 2) and command_class == original - 1),
+            "command_correct": bool(in_phase and command_class == original - 1),
             "direction_commands": len(direction_commands),
             "cue_to_command_seconds": (_value(first, "sample") - cue_sample) / sfreq if in_phase else None,
             "command_processing_seconds": float(_value(first, "processing_seconds", 0.0)) if first else None,
+            "cue_to_output_seconds": _value(first, "cue_to_output_seconds") if first else None,
+            "result_age_seconds": _value(first, "result_age_seconds") if first else None,
+            "output_timing_measured": bool(first and _value(first, "cue_to_output_seconds") is not None
+                                            and _value(first, "result_age_seconds") is not None),
             "no_command_reasons": dict(Counter(_value(c, "reason") for c in cmd_by[trial_id] if _value(c, "direction") == "NO_COMMAND")),
         }
-        if original in (1, 2):
-            target_rows.append(row)
-        elif original in (3, 4):
-            non_target_rows.append(row)
-        else:
-            unlabeled_rows.append(row)
+        target_rows.append(row)
     all_scores = _score(target_rows)
     return {
-        "scope": "Left/right cue-synchronous trial scoring; not the original four-class competition metric.",
+        "scope": "Personal left/right cue-synchronous trial scoring.",
         "aggregation": "Mean valid window probabilities per trial; first directional command per trial.",
         "probability_note": "LDA scores are not calibrated correctness guarantees.",
-        "latency_note": "Cue latency uses acquisition sample indices; processing time excludes device transport and UI display.",
+        "latency_note": "cue_to_command_seconds uses sample indices. cue_to_output_seconds ends at the final pre-send safety check (includes queue/filter/inference/prior disk work), not transport completion. Physical display onset and actuator acknowledgement are not measured.",
+        "physical_cue_alignment": "not_measured",
+        "actuator_latency": "not_measured",
+        "window_schedule": {"window_seconds": window_seconds, "step_seconds": step_seconds,
+                            "cue_offset_seconds": cue_offset_seconds, "imagery_seconds": imagery_seconds},
         "all": all_scores,
         "artifact_clean": _score([r for r in target_rows if not r["artifact_flag"]]),
         "artifact_flagged": _score([r for r in target_rows if r["artifact_flag"]]),
-        "non_target": {
-            "trials": len(non_target_rows),
-            "command_trials": sum(r["command_class"] is not None for r in non_target_rows),
-            "direction_commands": sum(r["direction_commands"] for r in non_target_rows),
-            "interpretation": "Feet/tongue outputs are reported separately; this binary model has no rest or non-control detector.",
-            "per_trial": non_target_rows,
-        },
-        "unlabeled_trials": len(unlabeled_rows),
-        "unlabeled_per_trial": unlabeled_rows,
         "stability": {
             "duplicate_direction_commands": duplicate_commands, "out_of_phase_direction_commands": out_of_phase,
             "unknown_trial_predictions": sum(_value(p, "trial_id") not in trial_ids for p in predictions),
@@ -1841,7 +1823,7 @@ def evaluate(trials, predictions, commands, sfreq=250.0, imagery_seconds=4.0):
 
 
 # ========================================================================
-# 15. CSP 与 LDA 训练
+# 14. CSP 与 LDA 训练
 # ========================================================================
 
 class _WindowProbe:
@@ -1856,6 +1838,13 @@ class ExtractedWindows:
     valid_prediction_indices: list
 
 
+def _recording_config(recording):
+    values = recording.metadata.get("config")
+    if not isinstance(values, dict):
+        raise ValueError("Personal recording is missing its acquisition configuration; import the original capture again")
+    return Config.from_dict(values)
+
+
 def extract_windows(recording, config=None):
     """Use the deployed Runtime unchanged; truth is never passed to its model.
 
@@ -1863,7 +1852,7 @@ def extract_windows(recording, config=None):
     Runtime supplies to predict_proba. Invalid predictions remain in the result
     so validation also replays streak resets caused by rejected windows.
     """
-    config = config or Config()
+    config = config if config is not None else _recording_config(recording)
     windows, observed_keys, predictions = [], [], []
 
     def observe(window, prediction):
@@ -1923,7 +1912,102 @@ def _recording_digest(recording):
     return hasher.hexdigest()
 
 
-def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confirmations=(2, 3), exclude_artifacts=True):
+class CalibrationDataError(ValueError):
+    """Data cannot support the declared calibration protocol; retain its audit."""
+
+    def __init__(self, report):
+        self.report = report
+        super().__init__("Calibration needs additional collection / 需要补采或调整采集：" + "; ".join(report["issues"]))
+
+
+def audit_calibration(recording, extraction, config, *, exclude_artifacts=True,
+                      min_trials_per_class_per_run=10, max_class_ratio=2.0,
+                      max_rejected_trial_fraction=0.5, max_rejected_window_fraction=0.5):
+    """Count independent trials, including entirely absent/rejected trials.
+
+    These configurable collection gates are engineering minimums, not a claim
+    that a particular sample count guarantees useful human performance.
+    Overlapping windows never increase the independent trial count.
+    """
+    if (isinstance(min_trials_per_class_per_run, bool)
+            or not isinstance(min_trials_per_class_per_run, Integral)
+            or min_trials_per_class_per_run < 2):
+        raise ValueError("min_trials_per_class_per_run must be an integer >= 2")
+    if isinstance(max_class_ratio, bool) or not isinstance(max_class_ratio, Real) or not isfinite(max_class_ratio) or max_class_ratio < 1:
+        raise ValueError("max_class_ratio must be finite and >= 1")
+    for name, value in (("max_rejected_trial_fraction", max_rejected_trial_fraction),
+                        ("max_rejected_window_fraction", max_rejected_window_fraction)):
+        if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value) or not 0 <= value < 1:
+            raise ValueError(f"{name} must be in [0, 1)")
+    predictions_by_trial = defaultdict(list)
+    for prediction in extraction.predictions:
+        predictions_by_trial[prediction.trial_id].append(prediction)
+    valid_counts = Counter(extraction.predictions[index].trial_id for index in extraction.valid_prediction_indices)
+    expected_per_trial = ((config.samples(config.imagery_seconds - config.cue_offset_seconds)
+                           - config.window_samples) // config.step_samples + 1)
+    rows, issues = [], []
+    for run_id in sorted({t.run_id for t in recording.trials}, key=str):
+        trials = [t for t in recording.trials if t.run_id == run_id]
+        target = {"LEFT": 0, "RIGHT": 0}
+        valid = dict(target)
+        fit = dict(target)
+        reasons = Counter()
+        valid_windows = 0
+        missing_windows = 0
+        for trial in trials:
+            label = "LEFT" if trial.original_class == 1 else "RIGHT"
+            target[label] += 1
+            if valid_counts[trial.trial_id]:
+                valid[label] += 1
+                if not exclude_artifacts or not trial.artifact_flag:
+                    fit[label] += 1
+            valid_windows += valid_counts[trial.trial_id]
+            trial_predictions = predictions_by_trial[trial.trial_id]
+            reasons.update(p.quality for p in trial_predictions if p.quality != "OK")
+            missing_windows += max(0, expected_per_trial - len(trial_predictions))
+        if missing_windows:
+            reasons["MISSING_SCHEDULED_WINDOW"] += missing_windows
+        expected_windows = len(trials) * expected_per_trial
+        rejected_trial_fraction = 1 - sum(fit.values()) / len(trials)
+        rejected_window_fraction = 1 - valid_windows / expected_windows
+        class_ratio = max(fit.values()) / min(fit.values()) if min(fit.values()) else None
+        row = {
+            "run_id": run_id, "target_trials_per_class": target,
+            "quality_valid_trials_per_class": valid, "fit_trials_per_class": fit,
+            "expert_flagged_trials": sum(bool(t.artifact_flag) for t in trials),
+            "rejected_trial_fraction": rejected_trial_fraction,
+            "expected_windows": expected_windows, "quality_valid_windows": valid_windows,
+            "rejected_window_fraction": rejected_window_fraction,
+            "missing_windows": missing_windows, "invalid_window_reasons": dict(reasons),
+            "fit_class_ratio": class_ratio,
+        }
+        rows.append(row)
+        for label, count in fit.items():
+            if count < min_trials_per_class_per_run:
+                issues.append(f"Run {run_id} {label}: {count} valid fit trials; collect at least {min_trials_per_class_per_run - count} more")
+        if class_ratio is None or class_ratio > max_class_ratio:
+            issues.append(f"Run {run_id}: valid LEFT/RIGHT trial imbalance exceeds {max_class_ratio:g}")
+        if rejected_trial_fraction > max_rejected_trial_fraction:
+            issues.append(f"Run {run_id}: rejected fit trials {rejected_trial_fraction:.1%} exceed {max_rejected_trial_fraction:.1%}")
+        if rejected_window_fraction > max_rejected_window_fraction:
+            issues.append(f"Run {run_id}: rejected/missing windows {rejected_window_fraction:.1%} exceed {max_rejected_window_fraction:.1%}")
+    if len(rows) < 2:
+        issues.append("At least two complete acquisition runs are required; collect another balanced run")
+    return {
+        "status": "READY_TO_TRAIN" if not issues else "NEEDS_MORE_COLLECTION",
+        "limits": {"min_trials_per_class_per_run": int(min_trials_per_class_per_run),
+                   "max_class_ratio": float(max_class_ratio),
+                   "max_rejected_trial_fraction": float(max_rejected_trial_fraction),
+                   "max_rejected_window_fraction": float(max_rejected_window_fraction)},
+        "trial_count_note": "Independent trials, not overlapping windows. Minimum counts do not establish online readiness.",
+        "window_rejection_note": "Quality-rejected and missing scheduled windows; expert flags separately exclude trials from fitting.",
+        "runs": rows, "issues": issues,
+    }
+
+
+def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confirmations=(2, 3), exclude_artifacts=True,
+                    min_trials_per_class_per_run=10, max_class_ratio=2.0,
+                    max_rejected_trial_fraction=0.5, max_rejected_window_fraction=0.5):
     """Train only a T session; select the decision policy using held-out runs.
 
     All overlapping windows from a trial and its entire run stay in one fold.
@@ -1931,26 +2015,53 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
     Validation reports include both clean and flagged trials. E sessions are
     rejected before any window extraction, fit, or parameter selection.
     """
-    config = config or Config()
-    if not str(recording.session_id).upper().endswith("T"):
+    acquisition_config = _recording_config(recording)
+    config = config if config is not None else acquisition_config
+    if recording.metadata.get("synthetic"):
+        raise ValueError("Training requires recorded EEG; legacy synthetic recordings are not accepted")
+    if recording.metadata.get("source") != "personal_lsl":
+        raise ValueError("Training requires a personal LSL calibration recording")
+    if recording.session_id != "T":
         raise ValueError("Training requires a T session; E data must never select or fit parameters")
+    # Signal-processing settings may be chosen on calibration data and then
+    # frozen. Device identity and the actual recorded cue duration cannot be
+    # changed by a training override or replay would manufacture new phases.
+    for key in ("sfreq", "channels", "reference", "unit", "imagery_seconds"):
+        if getattr(config, key) != getattr(acquisition_config, key):
+            raise ValueError(f"Training configuration must preserve recorded {key}")
+    thresholds, confirmations = tuple(thresholds), tuple(confirmations)
     if not thresholds or not confirmations:
         raise ValueError("At least one threshold and confirmation count are required")
+    policies = [replace(config, threshold=threshold, confirmations=count)
+                for threshold in thresholds for count in confirmations]
     trials = list(recording.trials)
     if any(t.subject_id != recording.subject_id or t.session_id != recording.session_id for t in trials):
         raise ValueError("Training recording must contain exactly its declared subject and session")
-    if any(t.original_class not in (1, 2, 3, 4) for t in trials):
-        raise ValueError("Training trials require explicit original classes 1 through 4")
+    if any(isinstance(t.original_class, bool) or not isinstance(t.original_class, Integral)
+           or t.original_class not in (1, 2) for t in trials):
+        raise ValueError("Training requires personal truth labels 1=LEFT or 2=RIGHT")
     truth = {t.trial_id: t for t in trials}
     if len(truth) != len(trials):
         raise ValueError("Trial IDs must be unique")
     run_ids = sorted({t.run_id for t in trials}, key=str)
-    if len(run_ids) < 2:
-        raise ValueError("At least two runs are required for leave-one-run-out validation")
+    for trial in trials:
+        acquired_run = int(np.searchsorted(recording.run_starts, trial.cue_sample, side="right"))
+        if trial.run_id != acquired_run or acquired_run == 0:
+            raise ValueError("Trial run_id differs from acquisition RUN_START boundaries; re-import the original capture")
+        run_end = recording.run_starts[acquired_run] if acquired_run < len(recording.run_starts) else recording.data.shape[1]
+        if trial.cue_sample + config.samples(config.imagery_seconds) > run_end:
+            raise ValueError("Trial imagery crosses an acquisition run boundary or has incomplete EEG")
     extraction = extract_windows(recording, config)
+    audit = audit_calibration(recording, extraction, config, exclude_artifacts=exclude_artifacts,
+                              min_trials_per_class_per_run=min_trials_per_class_per_run,
+                              max_class_ratio=max_class_ratio,
+                              max_rejected_trial_fraction=max_rejected_trial_fraction,
+                              max_rejected_window_fraction=max_rejected_window_fraction)
+    if audit["issues"]:
+        raise CalibrationDataError(audit)
     valid_predictions = [extraction.predictions[i] for i in extraction.valid_prediction_indices]
     window_trials = [truth[p.trial_id] for p in valid_predictions]
-    eligible = np.asarray([t.original_class in (1, 2) and (not exclude_artifacts or not t.artifact_flag)
+    eligible = np.asarray([not exclude_artifacts or not t.artifact_flag
                            for t in window_trials], dtype=bool)
     if not eligible.any():
         raise ValueError("No quality-approved left/right training windows")
@@ -1980,14 +2091,12 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
             "training_windows": len(fit_indices), "validation_valid_windows": len(held_indices),
         })
     candidates = []
-    for threshold in thresholds:
-        for count in confirmations:
-            candidate = replace(config, threshold=float(threshold), confirmations=int(count))
-            commands = _validation_commands(candidate, trials, oof_predictions)
-            metrics = evaluate(trials, oof_predictions, commands, sfreq=config.sfreq, imagery_seconds=config.imagery_seconds)
-            candidates.append({"threshold": candidate.threshold, "confirmations": candidate.confirmations,
-                               "metrics": metrics["all"], "artifact_clean": metrics["artifact_clean"],
-                               "artifact_flagged": metrics["artifact_flagged"]})
+    for candidate in policies:
+        commands = _validation_commands(candidate, trials, oof_predictions)
+        metrics = evaluate(trials, oof_predictions, commands, **_evaluation_parameters(config))
+        candidates.append({"threshold": candidate.threshold, "confirmations": candidate.confirmations,
+                           "metrics": metrics["all"], "artifact_clean": metrics["artifact_clean"],
+                           "artifact_flagged": metrics["artifact_flagged"]})
 
     def selection_key(candidate):
         metrics = candidate["metrics"]
@@ -1997,13 +2106,12 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
     selected = max(candidates, key=selection_key)
     frozen = replace(config, threshold=selected["threshold"], confirmations=selected["confirmations"])
     selected_commands = _validation_commands(frozen, trials, oof_predictions)
-    selected_metrics = evaluate(trials, oof_predictions, selected_commands, sfreq=config.sfreq, imagery_seconds=config.imagery_seconds)
+    selected_metrics = evaluate(trials, oof_predictions, selected_commands, **_evaluation_parameters(config))
     for fold in fold_records:
         fold_trials = [t for t in trials if t.run_id == fold["held_out_run"]]
         fold_ids = {t.trial_id for t in fold_trials}
         fold["metrics"] = evaluate(fold_trials, [p for p in oof_predictions if p.trial_id in fold_ids],
-                                   [c for c in selected_commands if c.trial_id in fold_ids], sfreq=config.sfreq,
-                                   imagery_seconds=config.imagery_seconds)
+                                   [c for c in selected_commands if c.trial_id in fold_ids], **_evaluation_parameters(config))
     final_model = _fit_model(frozen, extraction.windows[eligible], labels[eligible])
     source_hash = _recording_digest(recording)
     versions = dependency_versions()
@@ -2011,27 +2119,28 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
         "training_subject": recording.subject_id, "training_session": recording.session_id,
         "recording_metadata": dict(recording.metadata),
-        "synthetic": bool(recording.metadata.get("synthetic", False)),
         "recording_sha256": source_hash, "dependencies": versions,
         "class_mapping": CLASS_MAPPING, "original_class_mapping": {"1": 0, "2": 1},
         "filter_initialization": "zero_state_per_continuous_segment",
         "warmup_seconds": frozen.warmup_seconds, "reference": frozen.reference,
         "training_artifact_policy": "exclude_expert_flagged" if exclude_artifacts else "include_expert_flagged",
         "training_windows": int(eligible.sum()),
+        "calibration_data_limits": audit["limits"],
+        "window_quality_limits": asdict(QualityThresholds.for_window(frozen)),
         "training_trial_ids": sorted({t.trial_id for t, good in zip(window_trials, eligible) if good}),
         "validation": "leave-one-run-out; all overlapping trial windows grouped by run",
         "independent_test_used": False,
     }
     report = {
         "training_subject": recording.subject_id, "training_session": recording.session_id,
-        "synthetic": metadata["synthetic"],
-        "data_scope": "Synthetic engineering demonstration; not recorded human EEG." if metadata["synthetic"] else "Recorded EEG, subject-specific training.",
+        "data_scope": "Personal LSL calibration EEG, subject-specific training.",
         "validation_scope": "Internal T-session selection; the selected CV score is not an independent test estimate.",
         "window_extraction": "Exact deployed Runtime window observer, causal filtering, neutral replay markers.",
         "processing_time_scope": "CV measures individual model calls plus observed extraction-gate overhead; independent replay measures the actual deployed decoder.",
         "artifact_policy": metadata["training_artifact_policy"],
-        "target_trials": sum(t.original_class in (1, 2) for t in trials),
-        "expert_flagged_target_trials": sum(t.original_class in (1, 2) and t.artifact_flag for t in trials),
+        "calibration_audit": audit,
+        "target_trials": len(trials),
+        "expert_flagged_target_trials": sum(t.artifact_flag for t in trials),
         "fit_windows": int(eligible.sum()), "all_valid_windows": len(extraction.windows),
         "invalid_window_count": sum(p.quality != "OK" for p in extraction.predictions),
         "folds": fold_records, "candidate_policies": candidates,
@@ -2042,6 +2151,7 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
     }
     sos = CausalPreprocessor(frozen).sos.copy()
     model_version = "csp-lda-" + digest({"recording": source_hash, "config": frozen.to_dict(), "dependencies": versions,
+                                        "window_quality_limits": metadata["window_quality_limits"],
                                         "artifact_policy": metadata["training_artifact_policy"]})[:16]
     bundle = ModelBundle(frozen, final_model, sos, model_version, metadata, report)
     bundle.validate()
@@ -2049,14 +2159,121 @@ def train_recording(recording, config=None, *, thresholds=(0.6, 0.7, 0.8), confi
 
 
 # ========================================================================
-# 16. 运行会话
+# 15. 运行会话
 # ========================================================================
+
+def _finalize_capture(recorder, config, source, summary, summary_name, target_status,
+                      primary_error, cleanup_errors, received_raw_samples):
+    """Commit completion only after closed raw files and all required reports exist."""
+    directory = recorder.directory
+    try:
+        recorder.close(status="finalizing", error=primary_error or (cleanup_errors[0] if cleanup_errors else None),
+                       received_raw_samples=received_raw_samples)
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+        manifest = {"format": "mi-bci-session-v1", "stream": recorder.info,
+                    "raw_samples": recorder.raw_samples, "accepted_raw_samples": recorder.accepted_raw_samples,
+                    "processed_raw_samples": recorder.processed_raw_samples,
+                    "received_raw_samples": received_raw_samples}
+
+    def current_status():
+        return "failed" if primary_error is not None or recorder.error is not None or cleanup_errors else target_status
+
+    def error_message():
+        # AsyncRecorder.close wraps writer failures; retain the original I/O
+        # cause rather than replacing it with the generic "Recorder failed".
+        original = primary_error or recorder.error or (cleanup_errors[0] if cleanup_errors else None)
+        return str(original) if original is not None else None
+
+    def update_summary():
+        summary.update({"status": current_status(), "error": error_message(),
+                        "cleanup_errors": [str(exc) for exc in cleanup_errors],
+                        "raw_samples": recorder.raw_samples, "received_raw_samples": received_raw_samples,
+                        "accepted_raw_samples": recorder.accepted_raw_samples,
+                        "persisted_raw_samples": recorder.raw_samples,
+                        "processed_raw_samples": recorder.processed_raw_samples,
+                        "unconfirmed_processed_samples": max(0, recorder.processed_raw_samples - recorder.raw_samples),
+                        "failed_to_retain_samples": max(0, received_raw_samples - recorder.accepted_raw_samples),
+                        "unwritten_accepted_samples": max(0, recorder.accepted_raw_samples - recorder.raw_samples),
+                        "unconfirmed_accepted_samples": max(0, recorder.accepted_raw_samples - recorder.raw_samples)})
+
+    def write_final_manifest():
+        manifest.update({"status": current_status(),
+                         "error": error_message(),
+                         "cleanup_errors": [str(exc) for exc in cleanup_errors],
+                         "finalization_complete": not cleanup_errors})
+        write_json(directory / "manifest.json", manifest)
+
+    # A diagnostic may read closed EEG while finalization is still pending. It
+    # must never mistake an active writer or an interrupted capture for complete.
+    manifest.update({"status": "finalizing" if current_status() != "failed" else "failed",
+                     "finalization_target_status": current_status(), "finalization_complete": False,
+                     "error": error_message()})
+    try:
+        write_json(directory / "manifest.json", manifest)
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+
+    diagnostics = {}
+    for filename, create in (
+            ("channel_quality.json", lambda: write_capture_quality(directory, config)),
+            ("alignment_report.json", lambda: write_capture_timing(directory, config, getattr(source, "timing_records", None)))):
+        try:
+            report = create()
+            diagnostics[filename] = report.get("status")
+            if report.get("report_write_error"):
+                details = report["report_write_error"]
+                raise RuntimeError(f"Failed to save {filename}: {details.get('type')}: {details.get('message')}")
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+            diagnostics[filename] = "write_failed"
+    summary["diagnostic_reports"] = diagnostics
+    try:
+        write_json(directory / "marker_transport.json", getattr(source, "timing_records", []))
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+    update_summary()
+    try:
+        write_json(directory / summary_name, summary)
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+        update_summary()
+        # A transient error may clear. A failed run never regains complete merely
+        # because its failure summary can subsequently be written.
+        try:
+            write_json(directory / summary_name, summary)
+        except BaseException as retry_exc:
+            cleanup_errors.append(retry_exc)
+            update_summary()
+    try:
+        write_final_manifest()
+    except BaseException as exc:
+        cleanup_errors.append(exc)
+        update_summary()
+        # Atomic write_json leaves the previous finalizing/failed manifest in
+        # place on failure. Best-effort repair keeps readable summaries aligned.
+        try:
+            write_json(directory / summary_name, summary)
+        except BaseException as repair_exc:
+            cleanup_errors.append(repair_exc)
+            update_summary()
+        try:
+            write_final_manifest()
+        except BaseException as repair_exc:
+            cleanup_errors.append(repair_exc)
+            update_summary()
+    return summary
+
 
 def record_session(source, config, output, observer=None, stop_event=None, context=None):
     """Record calibration EEG and neutral phases without loading a classifier.
 
     Raw samples are retained even when the causal quality check rejects them.
-    Cue classes belong in the paradigm's separate truth log, never this stream.
+    Cue classes belong in the external cue source's separate truth log, never this stream.
     """
     stop = stop_event if stop_event is not None else threading.Event()
     recorder = None
@@ -2064,9 +2281,12 @@ def record_session(source, config, output, observer=None, stop_event=None, conte
     caught = None
     cancelled = stop.is_set()
     quality_reasons = Counter()
-    counts = {"chunks": 0, "samples": 0, "valid_samples": 0, "markers": 0, "runs": 0}
+    counts = {"chunks": 0, "samples": 0, "valid_samples": 0, "markers": 0, "runs": 0,
+              "received_raw_samples": 0}
     began = time.perf_counter()
     summary = None
+    protocol = MarkerProtocol()
+    saw_session_end = False
     try:
         preprocessor = CausalPreprocessor(config)
         recorder = AsyncRecorder(output, source.info)
@@ -2080,13 +2300,25 @@ def record_session(source, config, output, observer=None, stop_event=None, conte
             try:
                 packet = next(iterator)
             except StopIteration:
+                if not saw_session_end and not stop.is_set():
+                    raise RuntimeError("Acquisition ended without SESSION_END; capture is incomplete")
                 break
             except Exception:
                 # LiveSource's bounded no-data timeout may finish a pending
-                # pull after the UI has requested cancellation.
+                # pull after the caller has requested cancellation.
                 if stop.is_set():
                     cancelled = True
                     break
+                raise
+            # Retain the last received packet even when cancellation arrived
+            # during pull; signal validation and inference may stop afterwards.
+            if isinstance(packet, EEGChunk):
+                counts["received_raw_samples"] += len(packet.timestamps)
+            try:
+                recorder.record(packet)
+            except RuntimeError:
+                if recorder.error is None:
+                    recorder.record(packet, timeout=5)
                 raise
             if stop.is_set():
                 break
@@ -2099,6 +2331,11 @@ def record_session(source, config, output, observer=None, stop_event=None, conte
             elif isinstance(packet, Marker):
                 if packet.kind not in NEUTRAL_KINDS:
                     raise ValueError("Calibration recording accepts only neutral phase markers")
+                protocol.observe(packet.kind, packet.trial_id, packet.timestamp)
+                if packet.kind == "DISCONNECT":
+                    raise RuntimeError("Experiment or EEG disconnected before completing the session")
+                if packet.kind == "SESSION_END":
+                    saw_session_end = True
                 counts["markers"] += 1
                 if packet.kind in {"RUN_START", "DISCONNECT"}:
                     preprocessor.reset()
@@ -2106,7 +2343,6 @@ def record_session(source, config, output, observer=None, stop_event=None, conte
                     counts["runs"] += 1
             else:
                 raise TypeError("Calibration source must emit EEGChunk or neutral Marker")
-            recorder.record(packet)
             if observer:
                 observer(packet)
         cancelled = stop.is_set()
@@ -2128,6 +2364,15 @@ def record_session(source, config, output, observer=None, stop_event=None, conte
         except BaseException as exc:
             cleanup_errors.append(exc)
         if recorder is not None:
+            counts["received_raw_samples"] += sum(len(p.timestamps) for p in getattr(source, "pending_raw", []))
+            try:
+                for packet in getattr(source, "pending_raw", []):
+                    recorder.record(packet, timeout=5)
+                    counts["samples"] += len(packet.timestamps)
+                if hasattr(source, "pending_raw"):
+                    source.pending_raw.clear()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
             status = "failed" if caught or cleanup_errors else "cancelled" if cancelled else "complete"
             summary = {
                 "mode": "calibration", "status": status, **counts,
@@ -2141,29 +2386,50 @@ def record_session(source, config, output, observer=None, stop_event=None, conte
                 recorder.record({"type": "SessionEnd", "error": str(caught) if caught else None,
                                  "cancelled": cancelled,
                                  "cleanup_errors": [str(exc) for exc in cleanup_errors]})
-                write_json(recorder.directory / "acquisition_summary.json", summary)
             except BaseException as exc:
                 cleanup_errors.append(exc)
-            try:
-                recorder.close(status=status, error=caught or (cleanup_errors[0] if cleanup_errors else None))
-            except BaseException as exc:
-                cleanup_errors.append(exc)
-        if caught is None and cleanup_errors:
+            _finalize_capture(recorder, config, source, summary, "acquisition_summary.json", status,
+                              caught, cleanup_errors, counts["received_raw_samples"])
+        if (caught is None and cleanup_errors
+                and not (cancelled and isinstance(sys.exc_info()[1], KeyboardInterrupt))):
             raise RuntimeError("Calibration recording cleanup failed") from cleanup_errors[0]
     return summary
 
 
-def run_session(source, bundle, output, observer=None, stop_event=None, queue_capacity=64, context=None):
+def run_session(source, bundle, output, observer=None, stop_event=None, queue_capacity=64, context=None,
+                result_stream_name="MI_Results"):
     if queue_capacity < 1:
         raise ValueError("Acquisition queue capacity must be positive")
-    stop = stop_event or threading.Event()
+    stop = stop_event if stop_event is not None else threading.Event()
+    live = getattr(source, "is_live", False)
+    safety = getattr(source, "safety", None)
+    if live and safety is None:
+        safety = LiveSafety(bundle.config, source.clock, stop)
+    publisher = None
     try:
-        decoder = Runtime(bundle.config, bundle.model, sos=bundle.sos, model_version=bundle.version)
+        if context is not None:
+            expected_mode = "live" if live else "replay"
+            if context.get("mode") != expected_mode:
+                raise ValueError("Capture context mode differs from the actual source mode")
+        def guard(trial_id, timestamp):
+            if stop.is_set():
+                return "STOPPED"
+            if recorder.error:
+                return "RECORDER_FAILED"
+            return safety.reason(trial_id, timestamp)
+        decoder = Runtime(bundle.config, bundle.model, sos=bundle.sos, model_version=bundle.version,
+                          validity_guard=guard if live else None)
         recorder = AsyncRecorder(output, source.info)
         if context is not None:
             write_json(recorder.directory / "capture_context.json", context)
+        publisher = ResultPublisher(recorder.directory, bundle.version, live=live,
+                                    clock=source.clock if live else time.monotonic,
+                                    stream_name=result_stream_name, ttl=bundle.config.max_age_seconds)
+        publisher.publish({"direction": "NO_COMMAND", "reason": "SESSION_STARTED"})
     except BaseException as exc:
         source.close()
+        if publisher is not None:
+            publisher.close()
         if "recorder" in locals():
             recorder.close(status="failed", error=exc)
         raise
@@ -2172,16 +2438,43 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
     failure = []
     predictions, commands = [], []
     max_backlog = 0
+    retained_after_stop = 0
+    received_raw_samples = 0
+    saw_session_end = False
+
+    def retain(packet):
+        try:
+            recorder.record(packet, timeout=0 if live else 5)
+        except RuntimeError:
+            # Stop decoding immediately on disk backlog; give the writer bounded
+            # time to retain this already-received packet before failing the run.
+            if safety is not None:
+                safety.fail("RECORDER_FAILED")
+            stop.set()
+            if recorder.error is None:
+                recorder.record(packet, timeout=5)
+            raise
 
     def acquire():
+        nonlocal received_raw_samples, saw_session_end
         iterator = None
         try:
             iterator = iter(source)
             for packet in iterator:
+                if isinstance(packet, EEGChunk):
+                    received_raw_samples += len(packet.timestamps)
+                retain(packet)
+                if isinstance(packet, Marker) and packet.kind == "SESSION_END":
+                    saw_session_end = True
+                if live and not hasattr(source, "safety"):
+                    if isinstance(packet, EEGChunk) and len(packet.timestamps):
+                        safety.eeg(packet.timestamps[-1])
+                    elif isinstance(packet, Marker):
+                        safety.marker(packet.kind, packet.trial_id, packet.timestamp)
                 if stop.is_set():
                     break
-                # Offline replay may backpressure. Live input fails closed on overload.
-                if getattr(source, "is_live", False):
+                # Raw data has already been retained even if decoding overflows.
+                if live:
                     incoming.put_nowait(packet)
                 else:
                     while not stop.is_set():
@@ -2190,23 +2483,66 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
                             break
                         except queue.Full:
                             continue
+            if live and not stop.is_set() and not saw_session_end:
+                raise RuntimeError("Live acquisition ended without SESSION_END")
         except BaseException as exc:
             failure.append(exc)
+            if safety is not None:
+                safety.fail("ACQUISITION_FAILED")
             stop.set()
         finally:
             try:
                 if iterator is not None and hasattr(iterator, "close"):
                     iterator.close()
+                source.close()
             except BaseException as exc:
                 failure.append(exc)
                 stop.set()
-            finally:
-                try:
-                    source.close()
-                except BaseException as exc:
-                    failure.append(exc)
-                    stop.set()
-                done.set()
+            # Includes the chunk pulled before an invalid marker and holdback
+            # samples beyond SESSION_END. Never infer during this recovery path.
+            try:
+                received_raw_samples += sum(len(p.timestamps) for p in getattr(source, "pending_raw", []))
+                for packet in getattr(source, "pending_raw", []):
+                    recorder.record(packet, timeout=5)
+                if hasattr(source, "pending_raw"):
+                    source.pending_raw.clear()
+            except BaseException as exc:
+                failure.append(exc)
+                stop.set()
+            done.set()
+
+    def emit(result):
+        def prepare(command):
+            now = source.clock()
+            deadline = now + bundle.config.max_age_seconds
+            if command.direction != "NO_COMMAND":
+                reason = guard(command.trial_id, command.timestamp)
+                if reason:
+                    command = replace(command, direction="NO_COMMAND", reason=reason)
+                    decoder.decision.clear_streak()
+                else:
+                    deadline = min(command.timestamp + bundle.config.max_age_seconds,
+                                   safety.cue_timestamp + bundle.config.imagery_seconds)
+            command = replace(command, emitted_at=now,
+                              result_age_seconds=now - command.timestamp,
+                              cue_to_output_seconds=(now - safety.cue_timestamp)
+                              if safety.cue_timestamp is not None and command.direction != "NO_COMMAND" else None)
+            return command, deadline
+
+        if isinstance(result, Command) and live:
+            # Disk preparation is outside the safety lock; the state check and
+            # LSL push occur together afterwards, with an absolute expiry.
+            row = publisher.publish(result, prepare=prepare, dispatch_lock=safety.lock)
+            result = Command(**row["payload"])
+        else:
+            publisher.publish(result)
+        recorder.record(result)
+        if isinstance(result, Prediction):
+            predictions.append(result)
+        elif isinstance(result, Command):
+            commands.append(result)
+        if observer:
+            observer(result)
 
     worker = threading.Thread(target=acquire, name="mi-acquisition", daemon=True)
     worker.start()
@@ -2219,347 +2555,1276 @@ def run_session(source, bundle, output, observer=None, stop_event=None, queue_ca
                 packet = incoming.get(timeout=0.1)
             except queue.Empty:
                 continue
-            recorder.record(packet)
             if observer:
                 observer(packet)
-            # Refresh live age after time spent in the acquisition queue.
-            if getattr(source, "is_live", False) and hasattr(packet, "data"):
-                from dataclasses import replace
+            if live and isinstance(packet, EEGChunk):
                 packet = replace(packet, received_at=source.clock())
             for result in decoder.process(packet):
-                recorder.record(result)
-                if isinstance(result, Prediction):
-                    predictions.append(result)
-                elif isinstance(result, Command):
-                    commands.append(result)
-                if observer:
-                    observer(result)
+                emit(result)
         if failure:
             raise RuntimeError("Acquisition failed or queue overflowed") from failure[0]
         if not stop.is_set():
             for result in decoder.finish():
-                recorder.record(result)
-                if isinstance(result, Prediction):
-                    predictions.append(result)
-                elif isinstance(result, Command):
-                    commands.append(result)
-                if observer:
-                    observer(result)
+                emit(result)
     except BaseException as exc:
         caught = exc
         raise
     finally:
-        was_stopped = stop.is_set()
+        was_stopped = stop.is_set() or isinstance(caught, KeyboardInterrupt)
         stop.set()
         cleanup_errors = []
         try:
             source.close()
         except BaseException as exc:
             cleanup_errors.append(exc)
-        worker.join(timeout=3)
+        worker.join(timeout=6)
         if worker.is_alive():
-            cleanup_errors.append(RuntimeError("Acquisition thread did not stop within three seconds"))
+            cleanup_errors.append(RuntimeError("Acquisition thread did not stop within six seconds"))
+        # Packets still waiting for inference are already in the raw recorder.
+        retained_after_stop = incoming.qsize()
+        while not incoming.empty():
+            incoming.get_nowait()
+        terminal_reason = "SESSION_FAILED" if caught or failure or cleanup_errors else "STOPPED" if was_stopped else "SESSION_ENDED"
         try:
-            recorder.record({"type": "SessionEnd", "error": str(caught) if caught else None,
-                             "cause": str(caught.__cause__) if caught and caught.__cause__ else None,
-                             "cancelled": was_stopped, "pending_acquisition_packets": incoming.qsize(),
-                             "cleanup_errors": [str(e) for e in cleanup_errors]})
+            terminal = Command(None, "NO_COMMAND", (decoder._last_sample or 0) + 1,
+                               source.clock() if live else time.monotonic(), terminal_reason)
+            emit(terminal)
         except BaseException as exc:
             cleanup_errors.append(exc)
         try:
-            recorder.close(status="cancelled" if was_stopped else "complete", error=caught or (cleanup_errors[0] if cleanup_errors else None))
+            publisher.close()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            recorder.record({"type": "SessionEnd", "error": str(caught or (failure[0] if failure else "")) or None,
+                             "cause": str(caught.__cause__) if caught and caught.__cause__ else None,
+                             "cancelled": was_stopped, "pending_acquisition_packets": 0,
+                             "retained_without_inference_packets": retained_after_stop,
+                             "received_raw_samples": received_raw_samples,
+                             "failed_to_retain_samples": max(0, received_raw_samples - recorder.accepted_raw_samples),
+                             "cleanup_errors": [str(e) for e in cleanup_errors]}, timeout=5)
         except BaseException as exc:
             cleanup_errors.append(exc)
         summary = {
             "predictions": len(predictions), "commands": len([c for c in commands if c.direction != "NO_COMMAND"]),
             "max_acquisition_backlog": max_backlog, "elapsed_wall_seconds": time.perf_counter() - start_clock,
-            "mode": "live" if getattr(source, "is_live", False) else "replay", "model_version": bundle.version,
-            "validation_scope": "Live hardware requires separate calibration and validation" if getattr(source, "is_live", False) else "Continuous replay only; not a live closed-loop experiment",
-            "pending_acquisition_packets": incoming.qsize(), "cleanup_errors": [str(e) for e in cleanup_errors],
-            "decoder_statistics": decoder.stats,
+            "mode": "live" if live else "replay", "model_version": bundle.version,
+            "validation_scope": "Live hardware requires separate calibration and validation" if live else "Continuous replay only; not a live closed-loop experiment",
+            "pending_acquisition_packets": 0, "retained_without_inference_packets": retained_after_stop,
+            "received_raw_samples": received_raw_samples, "persisted_raw_samples": recorder.raw_samples,
+            "failed_to_retain_samples": max(0, received_raw_samples - recorder.accepted_raw_samples),
+            "unwritten_accepted_samples": max(0, recorder.accepted_raw_samples - recorder.raw_samples),
+            "acquisition_thread_still_running": worker.is_alive(),
+            "session_end_observed": saw_session_end,
+            "cleanup_errors": [str(e) for e in cleanup_errors], "decoder_statistics": decoder.stats,
+            "latency_budget": {"first_window_seconds": bundle.config.cue_offset_seconds + bundle.config.window_seconds,
+                               "earliest_confirmation_seconds": bundle.config.cue_offset_seconds + bundle.config.window_seconds
+                               + (bundle.config.confirmations - 1) * bundle.config.step_seconds,
+                               "phase_deadline_seconds": bundle.config.imagery_seconds,
+                               "max_result_age_seconds": bundle.config.max_age_seconds},
         }
-        try:
-            write_json(recorder.directory / "runtime_summary.json", summary)
-        except BaseException as exc:
-            cleanup_errors.append(exc)
-        if caught is None and cleanup_errors:
-            raise RuntimeError("Session cleanup failed") from cleanup_errors[0]
+        _finalize_capture(recorder, bundle.config, source, summary, "runtime_summary.json",
+                          "cancelled" if was_stopped else "complete", caught or (failure[0] if failure else None),
+                          cleanup_errors, received_raw_samples)
+        if caught is None and (cleanup_errors or failure):
+            raise RuntimeError("Session cleanup failed") from (cleanup_errors or failure)[0]
     return predictions, commands
 
-
 # ========================================================================
-# 17. 中文界面与提示范式
+# 16. 采集线程安全状态与标记协议
 # ========================================================================
 
-REASON_TEXT = {"OK": "信号有效", "CONFIRMED": "方向已确认", "ALREADY_COMMITTED": "本试次已发出指令",
-               "LOW_CONFIDENCE": "分数尚未达到阈值", "AWAITING_CONFIRMATION": "等待连续窗口确认",
-               "INSUFFICIENT_DATA": "等待完整窗口", "BAD_SIGNAL": "信号质量不足，暂不发令",
-               "STALE_DATA": "数据延迟或断流，暂不发令", "MODEL_ERROR": "模型推理异常，暂不发令",
-               "OUTSIDE_MI_PHASE": "当前不在想象阶段"}
+class MarkerProtocol:
+    """Reject missing, repeated, reordered and reused trial phases immediately."""
 
+    def __init__(self):
+        self.run = False
+        self.trial = None
+        self.phase = "WAITING"
+        self.seen = set()
+        self.last_stamp = None
 
-def show_feedback(task, title="MI · 连续回放", scope="回放验证 · 非真实闭环实验"):
-    import tkinter as tk
-    from tkinter import ttk
-    root = tk.Tk()
-    root.title(title)
-    root.geometry("860x620")
-    root.minsize(720, 620)
-    root.configure(bg="#101a2b")
-    stop = threading.Event()
-    lock = threading.Lock()
-    state = {"phase": "连接与预热", "trial": "—", "p": (0.5, 0.5), "command": "等待指令", "reason": "", "samples": 0, "predictions": 0, "commands": 0, "done": False, "error": None}
-
-    def observe(item):
-        with lock:
-            if isinstance(item, EEGChunk):
-                state["samples"] += item.data.shape[1]
-            elif isinstance(item, Marker):
-                state["phase"] = {"RUN_START": "预热", "TRIAL_START": "准备", "MI_START": "运动想象", "MI_END": "休息", "DISCONNECT": "连接中断"}.get(item.kind, item.kind)
-                if item.trial_id:
-                    state["trial"] = item.trial_id
-                if item.kind in {"TRIAL_START", "MI_START"}:
-                    state["command"] = "准备下一次想象" if item.kind == "TRIAL_START" else "积累脑电证据"
-                    state["p"] = (0.5, 0.5)
-                    state["reason"] = ""
-            elif isinstance(item, Prediction):
-                state["predictions"] += 1
-                if item.probabilities is not None:
-                    state["p"] = item.probabilities
-                state["reason"] = item.quality
-            elif isinstance(item, Command):
-                state["reason"] = item.reason
-                if item.direction != "NO_COMMAND":
-                    state["command"] = "← 左手" if item.direction == "LEFT" else "右手 →"
-                    state["commands"] += 1
-
-    def worker():
-        try:
-            task(observe, stop)
-        except Exception as exc:
-            with lock:
-                state["error"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            with lock:
-                state["done"] = True
-
-    fg, muted = "#eaf3ff", "#9bacc4"
-    def label(text, size=12, color=fg, **kwargs):
-        return tk.Label(root, text=text, font=("Microsoft YaHei UI", size), bg="#101a2b", fg=color, **kwargs)
-
-    label("MOTOR IMAGERY", 12, "#64d6c3").pack(anchor="w", padx=38, pady=(28, 4))
-    label("脑电解码 · 实时反馈", 26).pack(anchor="w", padx=36)
-    label(scope, 11, muted).pack(anchor="w", padx=38, pady=(8, 20))
-    phase = label("", 16)
-    phase.pack(anchor="w", padx=38)
-    trial = label("", 10, muted)
-    trial.pack(anchor="w", padx=38, pady=(6, 14))
-    canvas = tk.Canvas(root, width=780, height=120, bg="#101a2b", highlightthickness=0)
-    canvas.pack(fill="x", padx=38)
-    command = label("等待指令", 28, "#64d6c3")
-    command.pack(pady=(12, 4))
-    reason = label("", 10, muted, wraplength=760)
-    reason.pack()
-    statistics = label("", 10, muted)
-    statistics.pack(pady=14)
-    status = label("运行中 · 每个试次最多一次方向指令", 10, muted, wraplength=760)
-    status.pack(pady=4)
-
-    def close():
-        stop.set()
-        if state["done"]:
-            root.destroy()
+    def observe(self, kind, trial_id, timestamp):
+        if (isinstance(timestamp, bool) or not isinstance(timestamp, Real) or not math.isfinite(timestamp)
+                or (self.last_stamp is not None and timestamp < self.last_stamp)):
+            raise ValueError("Marker timestamps are nonfinite or out of order")
+        if self.phase == "ENDED":
+            raise ValueError("Marker arrived after session end")
+        if kind == "DISCONNECT":
+            self.phase, self.trial = "ENDED", None
+        elif kind == "RUN_START":
+            if self.trial is not None or self.phase == "RUN_START":
+                raise ValueError("RUN_START interrupts a trial or repeats an empty run")
+            self.run, self.phase = True, "RUN_START"
+        elif kind == "TRIAL_START":
+            if not self.run or self.trial is not None or not trial_id or trial_id in self.seen:
+                raise ValueError("Missing phase or duplicate trial ID before TRIAL_START")
+            self.seen.add(trial_id)
+            self.trial, self.phase = trial_id, kind
+        elif kind == "MI_START":
+            if self.phase != "TRIAL_START" or trial_id != self.trial:
+                raise ValueError("MI_START requires its unique matching TRIAL_START")
+            self.phase = kind
+        elif kind == "MI_END":
+            if self.phase != "MI_START" or trial_id != self.trial:
+                raise ValueError("MI_END requires its unique matching MI_START")
+            self.trial, self.phase = None, kind
+        elif kind == "SESSION_END":
+            if self.trial is not None or self.phase != "MI_END":
+                raise ValueError("SESSION_END requires complete trials and a nonempty final run")
+            self.phase = "ENDED"
         else:
-            status.config(text="正在停止并保存记录…")
-            root.after(100, close)
-
-    ttk.Button(root, text="停止并保存 / 关闭", command=close).pack(pady=10)
-    root.protocol("WM_DELETE_WINDOW", close)
-
-    def refresh():
-        with lock:
-            snapshot = dict(state)
-        phase.config(text=snapshot["phase"])
-        trial.config(text=f"试次  {snapshot['trial']}")
-        canvas.delete("all")
-        width = max(500, canvas.winfo_width())
-        for row, (name, value, color) in enumerate(zip(("左手", "右手"), snapshot["p"], ("#64d6c3", "#75abff"))):
-            y = row * 56 + 12
-            canvas.create_text(0, y + 12, text=name, fill=fg, anchor="w", font=("Microsoft YaHei UI", 13))
-            canvas.create_rectangle(66, y, width - 80, y + 25, fill="#24334c", outline="")
-            canvas.create_rectangle(66, y, 66 + (width - 146) * value, y + 25, fill=color, outline="")
-            canvas.create_text(width - 5, y + 12, text=f"{value:.1%}", fill=fg, anchor="e", font=("Consolas", 13))
-        command.config(text=snapshot["command"])
-        reason.config(text=f"质量 / 决策：{REASON_TEXT.get(snapshot['reason'], snapshot['reason'] or '等待完整窗口')}")
-        statistics.config(text=f"采样点 {snapshot['samples']:,}    窗口 {snapshot['predictions']}    已发指令 {snapshot['commands']}")
-        if snapshot["done"]:
-            status.config(text=snapshot["error"] or "运行已结束 · 记录已保存", fg="#ffa59a" if snapshot["error"] else muted)
-        root.after(80, refresh)
-
-    threading.Thread(target=worker, name="mi-decoder", daemon=True).start()
-    refresh()
-    root.mainloop()
-    if state["error"]:
-        raise RuntimeError(state["error"])
+            raise ValueError("Unrecognized neutral phase")
+        self.last_stamp = timestamp
 
 
-def run_paradigm(output, stream_name="MI_Markers", trials=20, seed=42, runs=1, config=None, run_rest_seconds=15):
-    """Present cue classes locally; publish neutral phase JSON to LSL.
+class LiveSafety:
+    def __init__(self, config, clock, stop_event):
+        self.config, self.clock, self.stop = config, clock, stop_event
+        self.lock = threading.RLock()
+        self.protocol = MarkerProtocol()
+        self.latest_eeg = None
+        self.cue_timestamp = None
+        self.failure = None
 
-    Marker timestamps follow Tk redraw submission. They are software onset
-    estimates, not a photodiode measurement of physical monitor onset.
-    """
-    import json
-    from pathlib import Path
-    import random
+    def eeg(self, last_timestamp):
+        with self.lock:
+            self.latest_eeg = float(last_timestamp)
+
+    def marker(self, kind, trial_id, timestamp):
+        with self.lock:
+            try:
+                self.protocol.observe(kind, trial_id, timestamp)
+            except ValueError:
+                self.failure = "MARKER_PROTOCOL_ERROR"
+                raise
+            if kind == "MI_START":
+                self.cue_timestamp = timestamp
+
+    def fail(self, reason):
+        with self.lock:
+            self.failure = reason
+
+    def reason(self, trial_id, window_timestamp):
+        with self.lock:
+            now = self.clock()
+            if self.failure:
+                return self.failure
+            if self.stop.is_set():
+                return "STOPPED"
+            if self.protocol.phase == "ENDED":
+                return "SESSION_ENDED"
+            if self.latest_eeg is None or now - self.latest_eeg > self.config.max_age_seconds:
+                return "SIGNAL_LOST"
+            if now - window_timestamp > self.config.max_age_seconds:
+                return "STALE_RESULT"
+            if window_timestamp - now > self.config.timestamp_tolerance_seconds:
+                return "CLOCK_MISMATCH"
+            if self.protocol.phase != "MI_START" or self.protocol.trial != trial_id:
+                return "OUTSIDE_MI_PHASE"
+            if self.cue_timestamp is None or now >= self.cue_timestamp + self.config.imagery_seconds:
+                return "MI_DEADLINE_EXCEEDED"
+            return None
+
+# ========================================================================
+# 17. 稳定结果订阅接口
+# ========================================================================
+
+SCHEMA = "mi-results-v1"
+
+
+class ResultPublisher:
+    def __init__(self, directory, model_version, *, live=False, clock=time.monotonic,
+                 stream_name="MI_Results", ttl=0.5, outlet=None):
+        self.clock, self.ttl = clock, ttl
+        self.model_version, self.live = model_version, live
+        self.session_id = str(uuid.uuid4())
+        self.sequence = 0
+        self.lock = threading.Lock()
+        self.outlet = outlet
+        if live and outlet is None:
+            import pylsl
+            info = pylsl.StreamInfo(stream_name, "MI_Results", 1, 0, "string", self.session_id)
+            info.desc().append_child_value("schema", SCHEMA)
+            self.outlet = pylsl.StreamOutlet(info)
+        self.stream = (Path(directory) / "results.jsonl").open("x", encoding="utf-8")
+
+    def publish(self, result, *, valid_for=None, prepare=None, dispatch_lock=None):
+        with self.lock:
+            def envelope(item, kind_override=None, deadline=None):
+                now = self.clock()
+                self.sequence += 1
+                payload = asdict(item) if is_dataclass(item) else dict(item)
+                kind = type(item).__name__ if is_dataclass(item) else payload.pop("type", "Status")
+                lifetime = min(self.ttl, valid_for if valid_for is not None else self.ttl)
+                if deadline is not None:
+                    lifetime = min(lifetime, deadline - now)
+                if kind == "Command" and payload.get("direction") in {"LEFT", "RIGHT"} and lifetime <= 0:
+                    payload.update(direction="NO_COMMAND", reason="EXPIRED_BEFORE_SEND")
+                return {"schema": SCHEMA, "session_id": self.session_id, "sequence": self.sequence,
+                        "model_version": self.model_version, "mode": "live" if self.live else "replay",
+                        "type": kind_override or kind, "issued_at": now,
+                        "valid_for_seconds": max(0.0, lifetime), "payload": payload}
+
+            def log(row):
+                self.stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+                self.stream.flush()
+
+            # A preparation is audit-only and is NEVER transmitted. Disk work must
+            # not hold the acquisition-state lock. Recheck after it completes.
+            if prepare is not None:
+                log(envelope(result, "PreparedCommand"))
+                with dispatch_lock if dispatch_lock is not None else nullcontext():
+                    result, deadline = prepare(result)
+                    row = envelope(result, deadline=deadline)
+                    if self.outlet is not None:
+                        self.outlet.push_sample([json.dumps(row, ensure_ascii=False, allow_nan=False)],
+                                                timestamp=row["issued_at"])
+                # If this second write fails, the preparation remains auditable;
+                # delivery is uncertain and the session fails. Consumers expire.
+                log(row)
+            else:
+                row = envelope(result)
+                log(row)
+                if self.outlet is not None:
+                    self.outlet.push_sample([json.dumps(row, ensure_ascii=False, allow_nan=False)],
+                                            timestamp=row["issued_at"])
+            return row
+
+    def close(self):
+        self.stream.close()
+
+
+class ResultConsumer:
+    """Consumer-side duplicate, mode, clock, freshness and single-trial checks."""
+
+    def __init__(self, timeout=0.5):
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Subscription timeout must be positive and finite")
+        self.timeout = timeout
+        self.session_id = None
+        self.sequence = 0
+        self.seen_trials = set()
+        self.retired_sessions = set()
+        self.deadline = None
+
+    def accept(self, row, corrected_lsl_timestamp, now):
+        if row.get("schema") != SCHEMA or row.get("mode") != "live":
+            raise ValueError("Unsupported result schema or non-live source")
+        session = row.get("session_id")
+        seq = row.get("sequence")
+        if not isinstance(session, str) or not session or isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            raise ValueError("Invalid result identity")
+        if session in self.retired_sessions:
+            return {"direction": "NO_COMMAND", "reason": "OLD_SESSION"}
+        if session != self.session_id:
+            if self.session_id is not None:
+                self.retired_sessions.add(self.session_id)
+            self.session_id, self.sequence = session, 0
+            self.seen_trials.clear()
+        if seq <= self.sequence:
+            return {"direction": "NO_COMMAND", "reason": "DUPLICATE_RESULT"}
+        self.sequence = seq
+        ttl = row.get("valid_for_seconds")
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not math.isfinite(ttl) or ttl < 0:
+            raise ValueError("Invalid result lifetime")
+        if not math.isfinite(corrected_lsl_timestamp) or not math.isfinite(now):
+            raise ValueError("Invalid clock")
+        deadline = corrected_lsl_timestamp + min(ttl, self.timeout)
+        if now >= deadline or corrected_lsl_timestamp - now > 0.002:
+            return {"direction": "NO_COMMAND", "reason": "EXPIRED_RESULT"}
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid result payload")
+        # A prediction is telemetry only and must not extend an actuator's lease.
+        if row.get("type") not in {"Command", "Status"}:
+            return None
+        direction = payload.get("direction", "NO_COMMAND")
+        if direction not in {"LEFT", "RIGHT", "NO_COMMAND"}:
+            raise ValueError("Invalid direction")
+        if row.get("type") != "Command" and direction != "NO_COMMAND":
+            raise ValueError("Only a Command can carry a direction")
+        if direction != "NO_COMMAND":
+            trial_id = payload.get("trial_id")
+            if not isinstance(trial_id, str) or not trial_id:
+                raise ValueError("Direction requires a trial ID")
+            if trial_id in self.seen_trials:
+                return {"direction": "NO_COMMAND", "reason": "DUPLICATE_TRIAL"}
+            self.seen_trials.add(trial_id)
+        self.deadline = deadline if direction != "NO_COMMAND" else None
+        return payload
+
+    def watchdog(self, now):
+        if self.deadline is not None and now >= self.deadline:
+            self.deadline = None
+            return {"direction": "NO_COMMAND", "reason": "OUTPUT_EXPIRED"}
+        return None
+
+
+def subscribe(args):
     import pylsl
-    import tkinter as tk
-    from tkinter import ttk
+    consumer = ResultConsumer(args.timeout)
+    streams = pylsl.resolve_byprop("name", args.stream_name, timeout=5)
+    if len(streams) != 1:
+        raise ValueError("Exactly one result stream must match")
+    inlet = pylsl.StreamInlet(streams[0], recover=False, max_buflen=1,
+                             processing_flags=pylsl.proc_clocksync)
+    def emit(payload):
+        print(json.dumps(payload, ensure_ascii=False, allow_nan=False), flush=True)
+    try:
+        header = inlet.info(timeout=5)
+        if header.channel_count() != 1 or header.channel_format() != pylsl.cf_string:
+            raise ValueError("Result stream must contain one JSON string channel")
+        emit({"direction": "NO_COMMAND", "reason": "SUBSCRIBED"})
+        while True:
+            sample, stamp = inlet.pull_sample(timeout=min(0.05, args.timeout))
+            now = pylsl.local_clock()
+            if sample:
+                payload = consumer.accept(json.loads(sample[0]), stamp, now)
+                if payload is not None:
+                    emit(payload)
+            expired = consumer.watchdog(now)
+            if expired:
+                emit(expired)
+    finally:
+        emit({"direction": "NO_COMMAND", "reason": "SUBSCRIBER_STOPPED"})
+        inlet.close_stream()
 
-    if trials < 2 or trials % 2:
-        raise ValueError("Use a positive even number of trials")
-    if runs < 1 or not np.isfinite(run_rest_seconds) or run_rest_seconds < 0:
-        raise ValueError("Runs must be positive and between-run rest must be nonnegative")
-    config = config or Config()
-    target = Path(output)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(seed)
-    order = []
-    for _ in range(runs):
-        block = [1, 2] * (trials // 2)
-        rng.shuffle(block)
-        order.extend(block)
-    experiment_id = uuid4().hex[:12]
-    # Closing the context covers stream/Tk construction failures as well as
-    # callback errors; dropping the outlet releases its native LSL resource.
-    with target.open("x", encoding="utf-8") as log:
-        outlet = pylsl.StreamOutlet(pylsl.StreamInfo(stream_name, "Markers", 1, 0, "string", f"mi-paradigm-{time.time_ns()}"))
-        root = None
-        errors = []
+# ========================================================================
+# 18. 终端提示、随机平衡试次与独立标签
+# ========================================================================
+
+TIMING_LIMITATION = (
+    "时间戳在终端写入并 flush 返回后立即取 LSL local_clock；"
+    "它不等于已测量的视觉 onset。显示延迟及 EEG 对齐误差须用共同采集的外部触发/光电信号验证。"
+)
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    subject_id: str
+    session_id: str = "T"
+    runs: int = 2
+    trials_per_run: int = 20
+    seed: int = 1
+    imagery_seconds: float = 4.0
+    rest_seconds: float = 2.0
+    inter_trial_seconds: float = 2.0
+    run_rest_seconds: float = 3.0
+    marker_name: str = "MI_Markers"
+    consumer_timeout_seconds: float = 120.0
+    drain_seconds: float = 0.5
+    acquisition_config_sha256: str | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.subject_id, str) or not self.subject_id.strip():
+            raise ValueError("subject_id 必须为非空字符串")
+        if self.session_id not in {"T", "E"}:
+            raise ValueError("session_id 必须为 T（校准）或 E（独立测试）")
+        for name in ("runs", "trials_per_run", "seed"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} 必须为整数")
+        if self.runs < (2 if self.session_id == "T" else 1):
+            raise ValueError("校准至少需要两组；独立测试至少需要一组")
+        if self.trials_per_run < 2 or self.trials_per_run % 2:
+            raise ValueError("trials_per_run 必须为至少 2 的偶数，确保每组左右手平衡")
+        for name in ("imagery_seconds", "rest_seconds", "inter_trial_seconds",
+                     "run_rest_seconds", "consumer_timeout_seconds", "drain_seconds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+                raise ValueError(f"{name} 必须为有限正数")
+        if not isinstance(self.marker_name, str) or not self.marker_name.strip():
+            raise ValueError("marker_name 必须为非空字符串")
+
+
+def make_schedule(config, experiment_id):
+    """Same seed reproduces class order; independent UUIDs prevent ID reuse."""
+    rng = random.Random(config.seed)
+    schedule = []
+    for run in range(1, config.runs + 1):
+        classes = [1, 2] * (config.trials_per_run // 2)
+        rng.shuffle(classes)
+        for index, original_class in enumerate(classes, 1):
+            schedule.append({"run_id": run, "trial_index": index,
+                             "trial_id": f"{experiment_id}:r{run:03d}:t{index:04d}",
+                             "original_class": original_class})
+    return schedule
+
+
+def terminal_presenter(message):
+    sys.stdout.write("\n" + message + "\n")
+    sys.stdout.flush()
+
+
+def _json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+
+def _save_manifest(directory, manifest):
+    temporary = directory / "manifest.json.tmp"
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(_json(manifest) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(directory / "manifest.json")
+
+
+def _append_row(handle, row):
+    handle.write(_json(row) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _native_outlet(config, experiment_id):
+    import pylsl
+    info = pylsl.StreamInfo(config.marker_name, "Markers", 1, 0,
+                            pylsl.cf_string, "mi-experiment-" + experiment_id)
+    info.desc().append_child_value("schema", "neutral-kind-trial_id-v1")
+    info.desc().append_child_value("timestamp_semantics", "local_clock after terminal flush")
+    return pylsl.StreamOutlet(info, chunk_size=1), pylsl.local_clock
+
+
+def run_experiment(config, output, *, outlet=None, clock=None, sleep=time.sleep,
+                   presenter=terminal_presenter):
+    """Emit neutral phases and persist a separate truth log.
+
+    Inject outlet + LSL-domain clock together for software tests. The outlet must
+    implement wait_for_consumers(timeout), have_consumers(), and push_sample().
+    Each truth row stores the exact marker source timestamp plus push start/end
+    times. These measure sender work only, never receiver delay or visual onset.
+    A failed/aborted run emits DISCONNECT best-effort, stays visibly incomplete,
+    and cannot satisfy the strict personal-session import contract.
+    """
+    if (outlet is None) != (clock is None):
+        raise ValueError("outlet 和 clock 必须一起注入")
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False)
+    experiment_id = str(uuid4())
+    schedule = make_schedule(config, experiment_id)
+    manifest = {"format": "mi-experiment-v1", "status": "starting",
+                "experiment_id": experiment_id, "config": asdict(config),
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "schedule": schedule, "timing_limitation": TIMING_LIMITATION,
+                "labels_file": "labels.jsonl", "completed_trials": 0,
+                "emitted_markers": 0, "error": None, "cleanup_errors": []}
+    _save_manifest(output, manifest)
+    active_trial = None
+    active_run = None
+    previous_timestamp = -float("inf")
+    labels = None
+
+    def checked_clock():
+        stamp = float(clock())
+        if not isfinite(stamp):
+            raise RuntimeError("LSL 时钟返回了非有限时间戳")
+        return stamp
+
+    def wait_until(deadline):
+        while True:
+            if not outlet.have_consumers():
+                raise RuntimeError("标记接收端已断开；实验中止")
+            remaining = deadline - checked_clock()
+            if remaining <= 0:
+                return
+            sleep(min(remaining, 0.1))
+
+    def emit(kind, message, *, trial=None, original_class=None, check_consumer=True):
+        nonlocal previous_timestamp
+        if check_consumer and not outlet.have_consumers():
+            raise RuntimeError("标记接收端已断开；实验中止")
+        presenter(message)
+        # No logging, formatting or I/O between presentation completion and onset.
+        stamp = checked_clock()
+        if stamp < previous_timestamp:
+            raise RuntimeError("LSL 源时钟倒退；实验中止")
+        previous_timestamp = stamp
+        marker = {"kind": kind, "trial_id": trial}
+        send_start = checked_clock()
+        outlet.push_sample([_json(marker)], timestamp=stamp, pushthrough=True)
+        send_end = checked_clock()
+        if send_start < stamp or send_end < send_start:
+            raise RuntimeError("LSL 源时钟倒退；实验中止")
+        manifest["emitted_markers"] += 1
+        row = {**marker, "timestamp": stamp, "run_id": active_run,
+               "marker_send_start": send_start, "marker_send_end": send_end,
+               "presentation_clock": "pylsl.local_clock_after_terminal_flush"}
+        if original_class is not None:
+            row["original_class"] = original_class
+        # The stream never sees labels. If persistence fails after sending, abort
+        # immediately; the mismatched/incomplete log cannot be imported as valid.
+        _append_row(labels, row)
+        return stamp
+
+    try:
+        labels = (output / "labels.jsonl").open("x", encoding="utf-8")
+        if outlet is None:
+            outlet, clock = _native_outlet(config, experiment_id)
+        presenter(f"{TIMING_LIMITATION}\n已创建 {config.marker_name}。请在另一终端启动 record/live；等待标记接收端连接。")
+        if not outlet.wait_for_consumers(config.consumer_timeout_seconds):
+            raise RuntimeError("等待标记接收端超时；未开始试次")
+        manifest["status"] = "running"
+        _save_manifest(output, manifest)
+        for trial in schedule:
+            run = trial["run_id"]
+            if run != active_run:
+                active_run = run
+                onset = emit("RUN_START", f"第 {run}/{config.runs} 组：保持放松，等待开始。")
+                wait_until(onset + config.run_rest_seconds)
+            active_trial = trial["trial_id"]
+            onset = emit("TRIAL_START", f"第 {run} 组，第 {trial['trial_index']}/{config.trials_per_run} 次：休息，放松双手。",
+                         trial=active_trial)
+            wait_until(onset + config.rest_seconds)
+            direction = "左手 ←" if trial["original_class"] == 1 else "右手 →"
+            onset = emit("MI_START", f"想象 {direction} 运动；保持实际身体不动。",
+                         trial=active_trial, original_class=trial["original_class"])
+            wait_until(onset + config.imagery_seconds)
+            onset = emit("MI_END", "停止想象，休息。", trial=active_trial)
+            manifest["completed_trials"] += 1
+            active_trial = None
+            wait_until(onset + config.inter_trial_seconds)
+        emit("SESSION_END", "本次提示已完成，请等待采集器保存数据。")
+        # Give the final sample time to leave the outlet before its destruction.
+        sleep(config.drain_seconds)
+        manifest["status"] = "complete"
+        manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        _save_manifest(output, manifest)
+        return manifest
+    except BaseException as exc:
+        manifest["status"] = "aborted"
+        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        if outlet is not None and clock is not None and labels is not None:
+            try:
+                emit("DISCONNECT", "实验已中止；这次记录不应作为完整校准/验收数据。",
+                     trial=active_trial, check_consumer=False)
+                sleep(config.drain_seconds)
+            except BaseException as cleanup:
+                manifest["cleanup_errors"].append(f"DISCONNECT: {type(cleanup).__name__}: {cleanup}")
         try:
-            root = tk.Tk()
-            root.title("MI 提示范式 · 类别仅写入独立标签日志")
-            root.geometry("700x480")
-            root.configure(bg="#101a2b")
-            cue = tk.Label(root, text="等待连接", font=("Microsoft YaHei UI", 62), fg="white", bg="#101a2b")
-            cue.pack(expand=True)
-            note = tk.Label(root, text=f"共 {runs} 组，每组 {trials} 次；准备 2 秒 → 想象 {config.imagery_seconds:g} 秒 → 休息 2 秒", font=("Microsoft YaHei UI", 13), fg="#9bacc4", bg="#101a2b", wraplength=660)
-            note.pack(pady=24)
-            current = {"index": 0, "id": None, "active": False, "closed": False, "finished": False, "begun": False}
+            _save_manifest(output, manifest)
+        except BaseException as cleanup:
+            print(f"无法写入实验异常状态：{cleanup}；原始异常：{exc}", file=sys.stderr)
+        raise
+    finally:
+        if labels is not None:
+            labels.close()
 
-            def emit(kind, class_label=None):
-                root.update_idletasks()
-                stamp = pylsl.local_clock()
-                neutral = {"kind": kind, "trial_id": current["id"]}
-                outlet.push_sample([json.dumps(neutral)], timestamp=stamp)
-                log.write(json.dumps({**neutral, "timestamp": stamp, "original_class": class_label}) + "\n")
-                log.flush()
 
-            def prepare():
-                if current["closed"]:
-                    return
-                i = current["index"]
-                if i == len(order):
-                    cue.config(text="完成")
-                    current["id"] = None
-                    emit("SESSION_END")
-                    current["finished"] = True
-                    note.config(text=f"{len(order)} 个试次已完成，采集将自动保存，可关闭窗口")
-                    return
-                if i % trials == 0:
-                    current["id"] = None
-                    emit("RUN_START")
-                current["id"] = f"{experiment_id}-{i + 1:04d}"
-                cue.config(text="+")
-                note.config(text=f"第 {i // trials + 1}/{runs} 组 · 第 {i % trials + 1}/{trials} 次；手保持不动，想象相应手的运动感觉")
-                emit("TRIAL_START")
-                root.after(2000, imagine)
+def add_experiment_arguments(parser):
+    parser.add_argument("--subject", required=True)
+    parser.add_argument("--session-id", choices=["T", "E"], default="T")
+    parser.add_argument("--config", required=True, help="与采集器一致的设备 JSON，或冻结模型的 manifest.json")
+    parser.add_argument("--output", required=True, help="新的提示记录目录（必须不存在）")
+    parser.add_argument("--runs", type=int, default=2)
+    parser.add_argument("--trials-per-run", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--rest-seconds", type=float, default=2.0)
+    parser.add_argument("--inter-trial-seconds", type=float, default=2.0)
+    parser.add_argument("--run-rest-seconds", type=float, default=3.0)
+    parser.add_argument("--marker-name", default="MI_Markers")
+    parser.add_argument("--consumer-timeout-seconds", type=float, default=120.0)
 
-            def imagine():
-                if current["closed"]:
-                    return
-                current["active"] = True
-                klass = order[current["index"]]
-                cue.config(text="←" if klass == 1 else "→")
-                emit("MI_START", klass)
-                root.after(round(config.imagery_seconds * 1000), rest)
 
-            def rest():
-                if current["closed"]:
-                    return
-                cue.config(text="休息")
-                emit("MI_END")
-                current["active"] = False
-                current["index"] += 1
-                between_runs = current["index"] < len(order) and current["index"] % trials == 0
-                if between_runs:
-                    note.config(text=f"组间休息 {run_rest_seconds:g} 秒；请保持设备和坐姿稳定")
-                root.after(round((run_rest_seconds if between_runs else 2) * 1000), prepare)
+def config_from_args(args):
+    source = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    if not isinstance(source, dict):
+        raise ValueError("设备配置/模型 manifest 必须为 JSON 对象")
+    acquisition = source.get("config", source)
+    if not isinstance(acquisition, dict) or "imagery_seconds" not in acquisition or "warmup_seconds" not in acquisition:
+        raise ValueError("配置缺少 imagery_seconds 或 warmup_seconds")
+    imagery = acquisition["imagery_seconds"]
+    warmup = acquisition["warmup_seconds"]
+    if isinstance(warmup, bool) or not isinstance(warmup, (int, float)) or not isfinite(warmup) or warmup < 0:
+        raise ValueError("warmup_seconds 必须为有限非负数")
+    if args.run_rest_seconds < warmup:
+        raise ValueError("run_rest_seconds 不得小于采集配置的 warmup_seconds")
+    if "model_version" in source:
+        metadata = source.get("metadata")
+        if not isinstance(metadata, dict) or metadata.get("training_subject") != args.subject:
+            raise ValueError("实验受试者与冻结模型的校准受试者不一致")
+    canonical = json.dumps(acquisition, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return ExperimentConfig(subject_id=args.subject, session_id=args.session_id, runs=args.runs,
+                            trials_per_run=args.trials_per_run, seed=args.seed,
+                            imagery_seconds=imagery, rest_seconds=args.rest_seconds,
+                            inter_trial_seconds=args.inter_trial_seconds,
+                            run_rest_seconds=args.run_rest_seconds, marker_name=args.marker_name,
+                            consumer_timeout_seconds=args.consumer_timeout_seconds,
+                            acquisition_config_sha256=sha256(canonical.encode()).hexdigest())
 
-            def begin():
-                if current["closed"]:
-                    return
-                if not outlet.have_consumers():
-                    note.config(text="还没有采集程序连接。请先启动 record 或 live，再点击开始。")
-                    return
-                start_button.destroy()
-                current["begun"] = True
-                prepare()
 
-            def close():
-                if current["closed"]:
-                    return
-                current["closed"] = True
-                try:
-                    if current["begun"] and not current["finished"]:
-                        emit("DISCONNECT")
-                finally:
-                    current["active"] = False
-                    root.destroy()
+def cmd_experiment(args):
+    manifest = run_experiment(config_from_args(args), args.output)
+    print(f"提示记录完成：{Path(args.output).resolve()}；已完成 {manifest['completed_trials']} 次提示，EEG 有效性须另行检查。")
 
-            def callback_error(exc_type, exc, traceback):
-                errors.append(exc)
-                try:
-                    close()
-                except Exception as cleanup_error:
-                    errors.append(cleanup_error)
+# ========================================================================
+# 19. 真实设备预检与采集质量报告
+# ========================================================================
 
-            root.report_callback_exception = callback_error
-            start_button = ttk.Button(root, text="设备与解码器连接后，开始实验", command=begin)
-            start_button.pack(pady=20)
-            root.protocol("WM_DELETE_WINDOW", close)
-            root.mainloop()
-        finally:
-            if root is not None:
-                try:
-                    root.destroy()
-                except tk.TclError:
-                    pass
-            outlet = None
-        if errors:
-            raise RuntimeError("Paradigm stopped after a UI/LSL callback failed") from errors[0]
+@dataclass(frozen=True)
+class QualityThresholds:
+    """工程预检初始阈值；须在实际设备上核定，所有失败均阻止 ready。"""
+
+    min_duration_seconds: float = 5.0
+    max_rate_error_fraction: float = 0.05
+    max_timestamp_error_seconds: float = 0.002
+    max_sample_age_seconds: float = 0.5
+    max_silence_seconds: float = 0.5
+    flat_window_seconds: float = 1.0
+    flat_std_volts: float = 1e-9
+    max_abs_volts: float = 500e-6
+    max_ac_rms_volts: float = 100e-6
+    line_frequency_hz: float = 50.0
+    line_bandwidth_hz: float = 2.0
+    max_line_power_fraction: float = 0.35
+    high_frequency_hz: float = 40.0
+    max_high_frequency_power_fraction: float = 0.65
+    # A repeated exact extremum suggests clipping but does not identify the ADC rail.
+    saturation_run_seconds: float = 0.02
+
+    def __post_init__(self):
+        for name, value in asdict(self).items():
+            minimum_inclusive = name in {"max_timestamp_error_seconds", "flat_std_volts"}
+            if (isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value)
+                    or value < 0 or (value == 0 and not minimum_inclusive)):
+                raise ValueError(f"{name} must be finite and {'nonnegative' if minimum_inclusive else 'positive'}")
+        for name in ("max_rate_error_fraction", "max_line_power_fraction", "max_high_frequency_power_fraction"):
+            if getattr(self, name) >= 1:
+                raise ValueError(f"{name} must be below 1")
+        if self.flat_window_seconds > self.min_duration_seconds:
+            raise ValueError("flat_window_seconds cannot exceed min_duration_seconds")
+
+    @classmethod
+    def for_config(cls, config, overrides=None):
+        values = {p.name: getattr(config, p.name) for p in fields(cls) if hasattr(config, p.name)}
+        values.update({"max_timestamp_error_seconds": config.timestamp_tolerance_seconds,
+                  "max_sample_age_seconds": config.max_age_seconds,
+                  "max_abs_volts": config.max_abs_volts,
+                  "flat_std_volts": config.flat_std_volts,
+                  "flat_window_seconds": min(getattr(config, "flat_window_seconds", cls.flat_window_seconds),
+                                             getattr(config, "window_seconds", cls.min_duration_seconds))})
+        values["min_duration_seconds"] = max(cls.min_duration_seconds, values["flat_window_seconds"])
+        for name, value in (overrides or {}).items():
+            if name in values and value != values[name]:
+                raise ValueError(f"Preflight cannot override frozen channel/timing limit {name}; update the device configuration and recalibrate")
+        values.update(overrides or {})
+        return cls(**values)
+
+    @classmethod
+    def for_window(cls, config):
+        return replace(cls.for_config(config), min_duration_seconds=config.window_seconds,
+                       flat_window_seconds=min(config.flat_window_seconds, config.window_seconds))
+
+
+def _summary(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return {"min": None, "median": None, "p95": None, "max": None}
+    return {"min": float(np.min(values)), "median": float(np.median(values)),
+            "p95": float(np.quantile(values, .95)), "max": float(np.max(values))}
+
+
+def _longest_run(mask):
+    boundaries = np.diff(np.r_[False, np.asarray(mask, dtype=bool), False].astype(int))
+    lengths = np.flatnonzero(boundaries == -1) - np.flatnonzero(boundaries == 1)
+    return int(max(lengths, default=0))
+
+
+def channel_quality_report(data_volts, sfreq, channels, thresholds=None):
+    """逐通道原始信号报告，输入固定为 (channels, samples)，不修改/重排输入。"""
+    limits = thresholds or QualityThresholds()
+    data = np.asarray(data_volts, dtype=float)
+    if not np.isfinite(sfreq) or sfreq <= 0:
+        raise ValueError("sfreq must be positive")
+    if data.ndim != 2 or data.shape[0] != len(channels) or len(set(channels)) != len(channels):
+        raise ValueError("Expected one row per unique configured channel")
+    reports = []
+    window = max(2, round(limits.flat_window_seconds * sfreq))
+    for name, samples in zip(channels, data):
+        reasons = []
+        finite = np.isfinite(samples)
+        good = samples[finite]
+        if len(samples) < np.ceil(limits.min_duration_seconds * sfreq):
+            reasons.append("INSUFFICIENT_DATA")
+        if not finite.all():
+            reasons.append("NONFINITE")
+        maximum = float(np.max(np.abs(good))) if len(good) else None
+        std = float(np.std(good)) if len(good) else None
+        # Overlap catches flat intervals that straddle the fixed window boundaries.
+        starts = list(range(0, max(0, len(samples) - window + 1), max(1, window // 2)))
+        if len(samples) >= window and (not starts or starts[-1] != len(samples) - window):
+            starts.append(len(samples) - window)
+        flat_count = sum(np.isfinite(samples[start:start + window]).all()
+                         and np.std(samples[start:start + window]) <= limits.flat_std_volts for start in starts)
+        if flat_count or (std is not None and std <= limits.flat_std_volts):
+            reasons.append("FLATLINE")
+        if maximum is not None and maximum > limits.max_abs_volts:
+            reasons.append("EXCESSIVE_AMPLITUDE")
+        if std is not None and std > limits.max_ac_rms_volts:
+            reasons.append("EXCESSIVE_AC_RMS")
+        # Do not interpolate or concatenate across invalid samples for the spectrum.
+        line_fraction = high_fraction = None
+        line_observable = limits.line_frequency_hz + limits.line_bandwidth_hz < sfreq / 2
+        high_observable = limits.high_frequency_hz < sfreq / 2
+        if len(samples) >= window and finite.all():
+            frequencies, density = welch(samples, fs=sfreq, nperseg=min(len(samples), max(window, round(2 * sfreq))))
+            included = frequencies >= 1.0
+            total = float(np.sum(density[included]))
+            if total > 0:
+                if line_observable:
+                    line_fraction = float(np.sum(density[np.abs(frequencies - limits.line_frequency_hz)
+                                                        <= limits.line_bandwidth_hz]) / total)
+                if high_observable:
+                    high_fraction = float(np.sum(density[frequencies >= limits.high_frequency_hz]) / total)
+        if line_fraction is not None and line_fraction > limits.max_line_power_fraction:
+            reasons.append("LINE_NOISE")
+        if high_fraction is not None and high_fraction > limits.max_high_frequency_power_fraction:
+            reasons.append("HIGH_FREQUENCY_NOISE")
+        longest_rail = 0
+        if len(good):
+            longest_rail = max(_longest_run(finite & (samples == np.max(good))),
+                               _longest_run(finite & (samples == np.min(good))))
+        if longest_rail >= max(3, int(np.ceil(limits.saturation_run_seconds * sfreq))):
+            reasons.append("SATURATION_SUSPECTED")
+        reports.append({"channel": name, "status": "ok" if not reasons else "needs_adjustment",
+                        "reasons": reasons, "sample_count": len(samples), "nonfinite_count": int((~finite).sum()),
+                        "max_abs_volts": maximum, "ac_rms_volts": std, "flat_windows": int(flat_count),
+                        "checked_flat_windows": len(starts), "longest_extremum_run_samples": longest_rail,
+                        "line_power_fraction": line_fraction, "line_band_observable": line_observable,
+                        "high_frequency_power_fraction": high_fraction, "high_frequency_band_observable": high_observable})
+    return reports
+
+
+def timing_report(timestamps, received_at, sfreq, elapsed_seconds, max_silence_seconds=0.0, thresholds=None):
+    """接收时刻须与校正后的 LSL 时间戳同钟域；每个样本保存其所属包的接收时刻。"""
+    limits = thresholds or QualityThresholds()
+    stamps, arrivals = np.asarray(timestamps, dtype=float), np.asarray(received_at, dtype=float)
+    if stamps.ndim != 1 or arrivals.shape != stamps.shape:
+        raise ValueError("One arrival time is required for every timestamp")
+    if not np.isfinite(sfreq) or sfreq <= 0 or not np.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
+        raise ValueError("Sampling rate and elapsed duration must be finite and positive")
+    if not np.isfinite(max_silence_seconds) or max_silence_seconds < 0:
+        raise ValueError("max_silence_seconds must be finite and nonnegative")
+    reasons = []
+    delta = np.diff(stamps)
+    good_delta = delta[np.isfinite(delta) & (delta > 0)]
+    expected = 1.0 / sfreq
+    errors = np.abs(good_delta - expected)
+    invalid = int((~np.isfinite(stamps)).sum())
+    nonmonotonic = int((np.isfinite(delta) & (delta <= 0)).sum())
+    gaps = int((good_delta > expected + limits.max_timestamp_error_seconds).sum())
+    violations = int((errors > limits.max_timestamp_error_seconds + 1e-12).sum())
+    span = float(stamps[-1] - stamps[0]) if len(stamps) >= 2 and np.isfinite(stamps[[0, -1]]).all() else 0
+    measured = (len(stamps) - 1) / span if span > 0 else None
+    received_rate = len(stamps) / elapsed_seconds
+    age = arrivals - stamps
+    if elapsed_seconds < limits.min_duration_seconds or len(stamps) < np.ceil(limits.min_duration_seconds * sfreq):
+        reasons.append("INSUFFICIENT_DATA")
+    if invalid or not np.isfinite(arrivals).all():
+        reasons.append("NONFINITE_TIMESTAMPS")
+    if nonmonotonic:
+        reasons.append("NONMONOTONIC_TIMESTAMPS")
+    if violations:
+        reasons.append("TIMESTAMP_INTERVAL_VIOLATIONS")
+    if measured is None or abs(measured / sfreq - 1) > limits.max_rate_error_fraction:
+        reasons.append("TIMESTAMP_RATE_MISMATCH")
+    if abs(received_rate / sfreq - 1) > limits.max_rate_error_fraction:
+        reasons.append("RECEIVED_RATE_MISMATCH")
+    if np.any(age > limits.max_sample_age_seconds):
+        reasons.append("STALE_SAMPLES")
+    if np.any(age < -limits.max_timestamp_error_seconds):
+        reasons.append("FUTURE_TIMESTAMPS")
+    if max_silence_seconds > limits.max_silence_seconds:
+        reasons.append("RECEIVE_DROPOUT")
+    return {"status": "ok" if not reasons else "needs_adjustment", "reasons": reasons,
+            "sample_count": len(stamps), "declared_sfreq": sfreq, "timestamp_sfreq": measured,
+            "received_sfreq": received_rate, "elapsed_seconds": elapsed_seconds,
+            "interval_seconds": _summary(good_delta), "absolute_interval_error_seconds": _summary(errors),
+            "sample_age_seconds": _summary(age), "nonfinite_timestamp_count": invalid,
+            "nonmonotonic_count": nonmonotonic, "gap_count": gaps,
+            "interval_violation_count": violations, "max_receive_silence_seconds": max_silence_seconds,
+            "sample_age_scope": "Clock-corrected timestamp to local pull completion; includes buffering and is not physical acquisition latency.",
+            "alignment_scope": "EEG timestamps only; actual cue-to-EEG alignment requires a shared hardware observation."}
+
+
+def _stream_mapping(header, config, units):
+    if abs(header.nominal_srate() - config.sfreq) > 1e-8:
+        raise ValueError("Declared sampling rate differs from device configuration")
+    if units and config.lsl_input_units and UNIT_SCALE.get(units) != UNIT_SCALE.get(config.lsl_input_units):
+        raise ValueError("Input units differ from device configuration")
+    units = units or config.lsl_input_units
+    if units is not None and units not in UNIT_SCALE:
+        raise ValueError("Unknown input units")
+    node = header.desc().child("channels").child("channel")
+    labels, scales = [], []
+    for _ in range(header.channel_count()):
+        labels.append(node.child_value("label"))
+        reported_unit = node.child_value("unit")
+        if reported_unit and units and UNIT_SCALE.get(reported_unit) != UNIT_SCALE.get(units):
+            raise ValueError("Explicit units conflict with stream metadata")
+        scales.append(UNIT_SCALE.get(reported_unit or units))
+        node = node.next_sibling()
+    reported_labels = list(labels)
+    if config.lsl_channel_labels is not None:
+        if len(config.lsl_channel_labels) != header.channel_count():
+            raise ValueError("Explicit channel mapping length differs from stream")
+        labels = list(config.lsl_channel_labels)
+    if len(set(labels)) != len(labels) or any(channel not in labels for channel in config.channels):
+        raise ValueError("Every configured electrode must occur exactly once in LSL mapping")
+    order = [labels.index(channel) for channel in config.channels]
+    if any(scales[index] is None for index in order):
+        raise ValueError("Missing/unknown units; verify V, mV or uV before preflight")
+    reference = header.desc().child_value("reference")
+    if reference and reference != config.reference:
+        raise ValueError("Stream reference conflicts with device configuration")
+    return order, np.asarray([scales[index] for index in order])[:, None], reported_labels
+
+
+def capture_preflight(config, eeg_name, duration_seconds=15.0, thresholds=None, units=None,
+                      resolve_timeout=5.0, *, lsl_module=None, monotonic=None):
+    """只连接指定真实 EEG 流，限时采集，关闭 inlet 后生成预检结果。"""
+    limits = thresholds or QualityThresholds.for_config(config)
+    if not np.isfinite(duration_seconds) or duration_seconds < limits.min_duration_seconds:
+        raise ValueError(f"Preflight duration must be at least {limits.min_duration_seconds:g} seconds")
+    if lsl_module is None:
+        import pylsl as lsl_module
+    monotonic = monotonic or time.monotonic
+    matches = lsl_module.resolve_byprop("name", eeg_name, timeout=resolve_timeout)
+    if len(matches) != 1:
+        raise ValueError("Exactly one numeric EEG stream must match --eeg-name")
+    inlet = lsl_module.StreamInlet(matches[0], max_buflen=max(1, int(np.ceil(duration_seconds))),
+                                  recover=False, processing_flags=lsl_module.proc_clocksync)
+    chunks, stamps, arrivals, errors = [], [], [], []
+    max_silence = 0.0
+    try:
+        header = inlet.info(timeout=resolve_timeout)
+        if header.channel_format() == lsl_module.cf_string:
+            raise ValueError("Preflight requires a numeric raw EEG stream")
+        order, scales, labels = _stream_mapping(header, config, units)
+        metadata = {"name": header.name(), "source_id": header.source_id(), "reported_labels": labels,
+                    "configured_channels": list(config.channels), "reference": config.reference,
+                    "unit": "V", "processing_flags": "proc_clocksync (no dejitter)"}
+        inlet.open_stream(timeout=resolve_timeout)
+        # Establish the offset before accepting samples. Only proc_clocksync applies it.
+        metadata["initial_clock_correction_seconds"] = float(inlet.time_correction(timeout=resolve_timeout))
+        # Drain any samples accumulated during clock initialization, avoiding stale startup backlog.
+        inlet.flush()
+        began = last_received = monotonic()
+        while monotonic() - began < duration_seconds:
+            try:
+                values, times = inlet.pull_chunk(timeout=min(.05, max(0.0, duration_seconds - (monotonic() - began))),
+                                                max_samples=config.chunk_samples)
+                now = monotonic()
+                max_silence = max(max_silence, now - last_received)
+                if times:
+                    received = lsl_module.local_clock()
+                    array = np.asarray(values, dtype=float)
+                    if array.shape != (len(times), header.channel_count()):
+                        raise ValueError("Malformed sample/channel dimensions in EEG chunk")
+                    chunks.append(array.T[order] * scales)
+                    stamps.extend(times)
+                    arrivals.extend([received] * len(times))
+                    last_received = now
+            except Exception as exc:
+                errors.append({"type": type(exc).__name__, "message": str(exc)})
+                break
+        elapsed = max(monotonic() - began, np.finfo(float).eps)
+    finally:
+        inlet.close_stream()
+    data = np.concatenate(chunks, axis=1) if chunks else np.empty((len(config.channels), 0))
+    channel_report = channel_quality_report(data, config.sfreq, config.channels, limits)
+    timing = timing_report(stamps, arrivals, config.sfreq, elapsed, max_silence, limits)
+    ready = not errors and timing["status"] == "ok" and all(row["status"] == "ok" for row in channel_report)
+    return {"format": "mi-bci-preflight-v1", "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "status": "ready" if ready else "needs_adjustment", "ready": ready,
+            "decision": "可以开始" if ready else "需要调整", "thresholds": asdict(limits),
+            "stream": metadata, "timing": timing, "channels": channel_report, "acquisition_errors": errors,
+            "bad_channel_policy": "Stop and correct electrode/contact/noise problems, then rerun. Never drop or reorder configured channels automatically.",
+            "contact_quality_scope": "Signal proxies only; no impedance was measured. Use the amplifier's impedance/contact check separately.",
+            "validation_scope": "This preflight does not validate real human classification or actual cue-to-EEG alignment."}
+
+
+def cmd_preflight(args, config=None):
+    """读取并验证唯一主文件中的设备配置。"""
+    output = Path(args.output)
+    if output.exists():
+        raise FileExistsError(f"Report already exists: {output}")
+    if config is None:
+        config = Config.from_dict(json.loads(Path(args.config).read_text(encoding="utf-8")))
+    overrides = json.loads(Path(args.thresholds).read_text(encoding="utf-8")) if getattr(args, "thresholds", None) else {}
+    limits = QualityThresholds.for_config(config, overrides)
+    report = capture_preflight(config, args.eeg_name, args.duration, limits, getattr(args, "units", None))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("x", encoding="utf-8") as stream:
+        json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    print(f"{report['decision']} ({report['status']}) — {output.resolve()}")
+    for row in report["channels"]:
+        if row["reasons"]:
+            print(f"  {row['channel']}: {', '.join(row['reasons'])}")
+    for reason in report["timing"]["reasons"]:
+        print(f"  timing: {reason}")
+    return 0 if report["ready"] else 2
+
+
+def _save_diagnostic(directory, filename, report):
+    """附加诊断不覆盖采集的原始错误；写盘错误仍明确反馈给调用者。"""
+    try:
+        with (Path(directory) / filename).open("w", encoding="utf-8") as stream:
+            json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    except Exception as exc:
+        report["status"] = "incomplete"
+        report["report_write_error"] = {"type": type(exc).__name__, "message": str(exc)}
+    return report
+
+
+def _capture_maps(directory, config):
+    directory = Path(directory)
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    stream = manifest.get("stream", {})
+    if (tuple(stream.get("channels", ())) != tuple(config.channels) or stream.get("sfreq") != config.sfreq
+            or stream.get("unit") != "V" or stream.get("reference") != config.reference):
+        raise ValueError("Captured channel order/rate/unit/reference differs from configuration")
+    raw_path, timestamps_path = directory / "raw_eeg.f64", directory / "timestamps.f64"
+    raw_bytes, timestamp_bytes = raw_path.stat().st_size, timestamps_path.stat().st_size
+    stride = 8 * len(config.channels)
+    available = min(raw_bytes // stride, timestamp_bytes // 8)
+    problems = []
+    if raw_bytes % stride or timestamp_bytes % 8 or raw_bytes // stride != timestamp_bytes // 8:
+        problems.append("RAW_TIMESTAMP_FILE_LENGTH_MISMATCH")
+    declared = manifest.get("raw_samples")
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared != available:
+        problems.append("MANIFEST_SAMPLE_COUNT_MISMATCH")
+    finalizing_closed_capture = (manifest.get("status") == "finalizing"
+                                and manifest.get("finalization_target_status") == "complete"
+                                and manifest.get("storage_verification", {}).get("status") == "confirmed"
+                                and manifest.get("accepted_raw_samples") == declared)
+    if manifest.get("status") != "complete" and not finalizing_closed_capture:
+        problems.append("CAPTURE_NOT_COMPLETE")
+    raw = np.memmap(raw_path, dtype="<f8", mode="r", shape=(available, len(config.channels))) if available else None
+    stamps = np.memmap(timestamps_path, dtype="<f8", mode="r", shape=(available,)) if available else None
+    return manifest, raw, stamps, available, problems
+
+
+def _capture_segments(directory, available, problems):
+    """仅读取轻量 chunk 索引；不复制原始录制。损坏后的字节仍在原文件中。"""
+    segments, expected = [], 0
+    with (Path(directory) / "chunks.jsonl").open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            try:
+                chunk = json.loads(line)
+                offset, count, start, segment = (chunk[key] for key in ("offset_samples", "count", "start_sample", "segment_id"))
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                       for value in (offset, count, start, segment)) or count == 0:
+                    raise ValueError("Invalid chunk indices")
+                if offset != expected or offset + count > available:
+                    raise ValueError("Chunk log has a gap/overlap or exceeds available raw data")
+                same = (segments and segments[-1]["segment_id"] == segment
+                        and segments[-1]["next_start_sample"] == start)
+                if same:
+                    segments[-1]["stop_offset"] = offset + count
+                    segments[-1]["next_start_sample"] = start + count
+                else:
+                    segments.append({"segment_id": segment, "start_offset": offset,
+                                     "stop_offset": offset + count, "next_start_sample": start + count})
+                expected = offset + count
+            except Exception as exc:
+                problems.append(f"CHUNK_LOG_INVALID_AT_LINE_{line_number}: {exc}")
+                break
+    if expected != available:
+        problems.append("RAW_SAMPLES_NOT_FULLY_INDEXED")
+    return segments, expected
+
+
+def write_capture_quality(directory, config):
+    """按连续采集段、非重叠窗口汇总质量，原始信号工作内存与会话长度无关。
+
+    这是原始信号诊断窗口比例，不冒充因果滤波后模型有效窗口比例。
+    缺文件、部分写盘及诊断写盘故障返回 incomplete，不遮蔽采集主因。
+    """
+    report = {"format": "mi-bci-capture-channel-quality-v1", "status": "incomplete", "issues": [],
+              "channels": [], "segments": [],
+              "scope": "Raw-voltage nonoverlapping diagnostic windows; not the causal model's valid-window fraction.",
+              "contact_quality_scope": "Signal proxies only, not hardware impedance measurements.",
+              "bad_channel_policy": "Do not drop/reorder channels. Correct the cause and reacquire before training/control."}
+    try:
+        manifest, raw, stamps, available, problems = _capture_maps(directory, config)
+        report.update({"session_status": manifest.get("status"), "session_error": manifest.get("error"),
+                       "available_samples": available, "issues": problems})
+        segments, indexed = _capture_segments(directory, available, problems)
+        report["indexed_samples"] = indexed
+        seconds = config.window_seconds
+        width = config.samples(seconds)
+        base = QualityThresholds.for_config(config)
+        limits = replace(base, min_duration_seconds=seconds, flat_window_seconds=min(base.flat_window_seconds, seconds))
+        report["thresholds"] = asdict(limits)
+        report["diagnostic_window_seconds"] = seconds
+        totals = [{"channel": channel, "sample_count": 0, "nonfinite_count": 0, "max_abs_volts": None,
+                   "complete_windows": 0, "bad_windows": 0, "reason_window_counts": Counter(),
+                   "incomplete_tail_samples": 0} for channel in config.channels]
+        for segment in segments:
+            segment_report = {"segment_id": segment["segment_id"], "start_offset": segment["start_offset"],
+                              "stop_offset": segment["stop_offset"], "complete_windows": 0,
+                              "any_bad_channel_windows": 0, "timestamp_bad_windows": 0,
+                              "incomplete_tail_samples": 0,
+                              "channel_bad_windows": {channel: 0 for channel in config.channels}}
+            for begin in range(segment["start_offset"], segment["stop_offset"], width):
+                end = min(begin + width, segment["stop_offset"])
+                complete = end - begin == width
+                # Bounded views/temporary arrays, never a complete recording copy.
+                rows = channel_quality_report(raw[begin:end].T, config.sfreq, config.channels, limits)
+                times = stamps[max(segment["start_offset"], begin - 1):end]
+                delta = np.diff(times)
+                timing_bad = bool(not np.isfinite(times).all() or np.any(delta <= 0)
+                                  or np.any(np.abs(delta - 1 / config.sfreq) > config.timestamp_tolerance_seconds + 1e-12))
+                if complete:
+                    segment_report["complete_windows"] += 1
+                    segment_report["timestamp_bad_windows"] += int(timing_bad)
+                else:
+                    segment_report["incomplete_tail_samples"] += end - begin
+                any_bad = False
+                for total, row in zip(totals, rows):
+                    total["sample_count"] += row["sample_count"]
+                    total["nonfinite_count"] += row["nonfinite_count"]
+                    if row["max_abs_volts"] is not None:
+                        total["max_abs_volts"] = max(total["max_abs_volts"] or 0, row["max_abs_volts"])
+                    if complete:
+                        total["complete_windows"] += 1
+                        total["reason_window_counts"].update(row["reasons"])
+                        if row["reasons"]:
+                            total["bad_windows"] += 1
+                            segment_report["channel_bad_windows"][row["channel"]] += 1
+                            any_bad = True
+                    else:
+                        total["incomplete_tail_samples"] += end - begin
+                        # These obvious defects remain visible even in an unscorable tail.
+                        for reason in row["reasons"]:
+                            if reason != "INSUFFICIENT_DATA":
+                                total.setdefault("tail_reasons", set()).add(reason)
+                if complete and any_bad:
+                    segment_report["any_bad_channel_windows"] += 1
+            count = segment_report["complete_windows"]
+            segment_report["bad_channel_window_fraction"] = segment_report["any_bad_channel_windows"] / count if count else None
+            segment_report["timestamp_bad_window_fraction"] = segment_report["timestamp_bad_windows"] / count if count else None
+            report["segments"].append(segment_report)
+        for total in totals:
+            count = total["complete_windows"]
+            total["bad_window_fraction"] = total["bad_windows"] / count if count else None
+            total["tail_reasons"] = sorted(total.get("tail_reasons", ()))
+            total["reason_window_counts"] = dict(total["reason_window_counts"])
+            total["status"] = "ok" if count and not total["bad_windows"] and not total["tail_reasons"] else "needs_adjustment"
+        report["channels"] = totals
+        if problems:
+            report["status"] = "incomplete"
+        elif (any(row["status"] != "ok" for row in totals)
+              or any(segment["timestamp_bad_windows"] for segment in report["segments"])):
+            report["status"] = "needs_adjustment"
+        else:
+            report["status"] = "ok"
+    except Exception as exc:
+        report["issues"].append(f"{type(exc).__name__}: {exc}")
+    return _save_diagnostic(directory, "channel_quality.json", report)
+
+
+class _BoundedStats:
+    """均匀随机保留最多 50k 观测；总数/min/max 精确，分位数标注为近似。"""
+
+    def __init__(self, capacity=50000):
+        self.capacity = capacity
+        self.values = np.empty(0)
+        self.keys = np.empty(0)
+        self.count = 0
+        self.minimum = self.maximum = None
+        self.rng = np.random.default_rng(712)
+
+    def add(self, values):
+        values = np.asarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+        if not len(values):
+            return
+        self.count += len(values)
+        self.minimum = min(self.minimum if self.minimum is not None else np.inf, float(values.min()))
+        self.maximum = max(self.maximum if self.maximum is not None else -np.inf, float(values.max()))
+        self.values = np.r_[self.values, values]
+        self.keys = np.r_[self.keys, self.rng.random(len(values))]
+        if len(self.keys) > self.capacity:
+            keep = np.argpartition(self.keys, self.capacity - 1)[:self.capacity]
+            self.keys, self.values = self.keys[keep], self.values[keep]
+
+    def report(self):
+        result = _summary(self.values)
+        result.update({"count": self.count, "min": self.minimum, "max": self.maximum,
+                       "p99": float(np.quantile(self.values, .99)) if len(self.values) else None,
+                       "quantiles_approximate": self.count > self.capacity,
+                       "quantile_sample_count": len(self.values)})
+        return result
+
+
+def write_capture_timing(directory, config, timing_records=None):
+    """保存分离的 EEG 抖动、标记接收年龄、格点对齐报告；建议不修改配置/模型。"""
+    report = {"format": "mi-bci-capture-timing-v1", "status": "incomplete", "issues": [],
+              "physical_cue_alignment": {"status": "not_measured", "reason": "Need a photodiode/audio-loopback/trigger channel to observe actual cue onset on the EEG acquisition clock."},
+              "scope": "Software clock-corrected timestamps and receive times; not physical acquisition/display onset latency.",
+              "eeg_sample_age_scope": {
+                  "start_field": "timestamps.f64: clock-corrected EEG sample timestamp",
+                  "end_field": "chunks.jsonl.received_at: live pipeline release time",
+                  "meaning": "Includes the live marker holdback and buffering before pipeline release; not pure network transport latency. Pending raw chunks in a failed capture can retain their original pull time."},
+              "recommendations": {"applied": False}}
+    try:
+        manifest, raw, stamps, available, problems = _capture_maps(directory, config)
+        report.update({"session_status": manifest.get("status"), "session_error": manifest.get("error"),
+                       "available_samples": available, "issues": problems})
+        _, indexed = _capture_segments(directory, available, problems)
+        report["indexed_samples"] = indexed
+        interval_errors, sample_ages = _BoundedStats(), _BoundedStats()
+        gaps = nonmonotonic = invalid_stamps = interval_violations = missing_receipts = 0
+        stale_samples = future_samples = 0
+        for begin in range(0, available, 65536):
+            times = stamps[max(0, begin - 1):min(available, begin + 65536)]
+            invalid_stamps += int((~np.isfinite(stamps[begin:min(available, begin + 65536)])).sum())
+            delta = np.diff(times)
+            positive = delta[np.isfinite(delta) & (delta > 0)]
+            nonmonotonic += int((np.isfinite(delta) & (delta <= 0)).sum())
+            gaps += int((positive > 1.5 / config.sfreq).sum())
+            errors = np.abs(positive - 1 / config.sfreq)
+            interval_violations += int((errors > config.timestamp_tolerance_seconds + 1e-12).sum())
+            interval_errors.add(errors[positive <= 1.5 / config.sfreq])
+        recorded_grid_ranges = []
+        with (Path(directory) / "chunks.jsonl").open(encoding="utf-8") as stream:
+            for line in stream:
+                chunk = json.loads(line)
+                offset, count = chunk["offset_samples"], chunk["count"]
+                if not isinstance(offset, int) or not isinstance(count, int) or offset < 0 or count < 1 or offset + count > available:
+                    raise ValueError("Chunk indices exceed available raw data")
+                start_sample = chunk.get("start_sample")
+                if isinstance(start_sample, bool) or not isinstance(start_sample, int) or start_sample < 0:
+                    raise ValueError("Chunk start_sample must be a nonnegative integer")
+                recorded_grid_ranges.append((start_sample, start_sample + count, offset))
+                received = chunk.get("received_at")
+                if not isinstance(received, (int, float)) or not np.isfinite(received):
+                    missing_receipts += count
+                    continue
+                for begin in range(offset, offset + count, 65536):
+                    ages = received - stamps[begin:min(begin + 65536, offset + count)]
+                    sample_ages.add(ages)
+                    stale_samples += int((ages > config.max_age_seconds).sum())
+                    future_samples += int((ages < -config.timestamp_tolerance_seconds).sum())
+        markers = []
+        with (Path(directory) / "events.jsonl").open(encoding="utf-8") as stream:
+            for line in stream:
+                row = json.loads(line)
+                if row.get("type") == "Marker":
+                    markers.append(row)
+        transport = list(timing_records) if timing_records is not None else markers
+        marker_ages, alignment = _BoundedStats(), _BoundedStats()
+        missing_marker_age = missing_alignment = 0
+        future_markers = beyond_grace = bad_grid = 0
+        identities = Counter()
+        for row in transport:
+            identities[(row.get("kind"), row.get("trial_id"), row.get("timestamp"))] += 1
+            received, timestamp = row.get("received_at"), row.get("timestamp")
+            if (isinstance(received, (int, float)) and np.isfinite(received)
+                    and isinstance(timestamp, (int, float)) and np.isfinite(timestamp)):
+                age = received - timestamp
+                marker_ages.add([age])
+                future_markers += int(age < -config.timestamp_tolerance_seconds)
+                beyond_grace += int(age > config.lsl_marker_grace_seconds)
+            else:
+                missing_marker_age += 1
+        grid_measurements, grid_sources = [], Counter()
+        for marker in markers:
+            value = marker.get("alignment_seconds")
+            source, missing_reason, recorded_offset = "recorded_marker_alignment", None, None
+            if value is None:
+                sample, timestamp = marker.get("sample"), marker.get("timestamp")
+                valid_sample = isinstance(sample, int) and not isinstance(sample, bool) and sample >= 0
+                valid_timestamp = (isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+                                   and np.isfinite(timestamp))
+                if valid_sample and valid_timestamp:
+                    matches = [offset + sample - start for start, stop, offset in recorded_grid_ranges
+                               if start <= sample < stop]
+                    if len(matches) == 1:
+                        recorded_offset = matches[0]
+                        if np.isfinite(stamps[recorded_offset]):
+                            # Sample numbering can differ from file offsets after a gap.
+                            # This recovers only the observed EEG grid, never physical cue onset.
+                            value = float(stamps[recorded_offset] - timestamp)
+                            source = "derived_from_recorded_grid"
+                        else:
+                            missing_reason = "NONFINITE_RECORDED_TIMESTAMP"
+                    else:
+                        missing_reason = "NO_RECORDED_SAMPLE_MATCH" if not matches else "AMBIGUOUS_RECORDED_SAMPLE_MATCH"
+                else:
+                    missing_reason = "INVALID_MARKER_SAMPLE_OR_TIMESTAMP"
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value):
+                alignment.add([value])
+                bad_grid += int(value < 0 or value > 1 / config.sfreq + config.timestamp_tolerance_seconds)
+            else:
+                source = "missing"
+                value = None
+                missing_reason = missing_reason or "INVALID_RECORDED_ALIGNMENT"
+                missing_alignment += 1
+            grid_sources[source] += 1
+            grid_measurements.append({"kind": marker.get("kind"), "trial_id": marker.get("trial_id"),
+                                      "sample": marker.get("sample"), "alignment_seconds": value,
+                                      "source": source, "recorded_offset_samples": recorded_offset,
+                                      "missing_reason": missing_reason})
+        interval, eeg_age, marker_age, grid = (stats.report() for stats in (interval_errors, sample_ages, marker_ages, alignment))
+        report.update({"eeg_interval_error_seconds_excluding_large_gaps": interval,
+                       "eeg_sample_age_seconds": eeg_age, "marker_transport_age_seconds": marker_age,
+                       "marker_to_next_eeg_sample_seconds": grid,
+                       "marker_grid_measurements": grid_measurements,
+                       "marker_grid_source_counts": dict(grid_sources),
+                       "expected_grid_quantization_seconds": [0, 1 / config.sfreq],
+                       "sample_gap_count": gaps, "nonmonotonic_timestamp_count": nonmonotonic,
+                       "nonfinite_timestamp_count": invalid_stamps, "timestamp_interval_violation_count": interval_violations,
+                       "stale_eeg_sample_count": stale_samples, "future_eeg_sample_count": future_samples,
+                       "future_marker_count": future_markers, "marker_age_beyond_current_grace_count": beyond_grace,
+                       "marker_age_scope": "Clock-corrected source-to-receipt age only. EEG holdback starts at EEG receipt, so marker age greater than holdback is not itself evidence of a late marker.",
+                       "unexpected_grid_alignment_count": bad_grid,
+                       "missing_eeg_receipt_samples": missing_receipts, "received_marker_count": len(transport),
+                       "aligned_event_count": len(markers), "missing_marker_receipts": missing_marker_age,
+                       "missing_marker_grid_measurements": missing_alignment,
+                       "duplicate_received_marker_count": sum(max(0, count - 1) for count in identities.values())})
+        forwarded = Counter((row.get("kind"), row.get("trial_id"), row.get("timestamp")) for row in markers)
+        report["unforwarded_received_marker_count"] = sum((identities - forwarded).values())
+        missing = []
+        if not interval["count"]:
+            missing.append("EEG_INTERVAL_MEASUREMENTS")
+        if not marker_age["count"] or missing_marker_age:
+            missing.append("MARKER_RECEIPT_MEASUREMENTS")
+        if not grid["count"] or missing_alignment:
+            missing.append("MARKER_GRID_ALIGNMENT_MEASUREMENTS")
+        if not eeg_age["count"] or missing_receipts:
+            missing.append("EEG_RECEIPT_MEASUREMENTS")
+        report["missing_measurements"] = missing
+        tolerance = (interval["max"] * 1.25 + .0002
+                     if interval["count"] and not gaps and not nonmonotonic and not invalid_stamps else None)
+        grace = max(0, marker_age["max"]) + .02 if marker_age["count"] else None
+        grace_fits = (grace is not None and eeg_age["count"] > 0
+                      and eeg_age["max"] + max(0.0, grace - config.lsl_marker_grace_seconds) < config.max_age_seconds)
+        report["recommendations"].update({
+            "candidate_timestamp_tolerance_seconds": tolerance,
+            "candidate_marker_grace_seconds": grace if grace_fits else None,
+            "marker_grace_fits_data_age_budget": grace_fits,
+            "current_timestamp_tolerance_seconds": config.timestamp_tolerance_seconds,
+            "current_marker_grace_seconds": config.lsl_marker_grace_seconds,
+            "method": "Candidate timestamp tolerance = maximum observed non-gap interval error × 1.25 + 0.2 ms; unavailable after gaps/clock faults. Conservative marker holdback candidate = maximum marker age + 20 ms (not a measured differential delay). Extra holdback plus observed maximum EEG pipeline age must stay within max_age_seconds.",
+            "review_required": "Engineering candidates from this capture only. Repeat with load and hardware onset validation; never widen tolerance to hide gaps, and recalibrate/revalidate when changing frozen processing."})
+        report["status"] = "incomplete" if problems or missing else "measured"
+        if not problems and (gaps or nonmonotonic or invalid_stamps or interval_violations or stale_samples
+                             or future_samples or future_markers or bad_grid
+                             or report["unforwarded_received_marker_count"]
+                             or report["duplicate_received_marker_count"]):
+            report["status"] = "needs_adjustment"
+    except Exception as exc:
+        report["issues"].append(f"{type(exc).__name__}: {exc}")
+    return _save_diagnostic(directory, "alignment_report.json", report)
 
 
 # ========================================================================
-# 18. 命令行与主入口
+# 20. 命令行与主入口
 # ========================================================================
-
-def _read(path, labels=None, strict=True):
-    if Path(path).suffix.lower() == ".gdf":
-        return load_gdf(path, labels_path=labels, strict=strict)
-    recording = load_recording(path)
-    if labels is not None:
-        if recording.session_id != "E":
-            raise ValueError("External evaluation labels may only be attached to an E session")
-        truth = load_labels(labels)
-        if len(truth) != len(recording.trials):
-            raise ValueError("Label count must match ALL original E trials before any class or artifact filtering")
-        if any(t.original_class is not None and t.original_class != value for t, value in zip(recording.trials, truth)):
-            raise ValueError("External labels conflict with the labels already stored in the recording")
-        recording.trials = [replace(t, original_class=int(value)) for t, value in zip(recording.trials, truth)]
-        recording.metadata = {**recording.metadata, "labels_file": Path(labels).name}
-    return recording
-
 
 def _timeline_digest(recording):
     """Identity of signal, timestamps and neutral cue alignment, excluding truth."""
@@ -2574,8 +3839,8 @@ def _timeline_digest(recording):
     return hasher.hexdigest()
 
 
-def _config(path=None):
-    return Config.from_dict(json.loads(Path(path).read_text(encoding="utf-8-sig"))) if path else Config()
+def _config(path):
+    return Config.from_dict(json.loads(Path(path).read_text(encoding="utf-8-sig")))
 
 
 def _brief(report):
@@ -2586,67 +3851,44 @@ def _brief(report):
     print(f"Command accuracy: {percent(scores['command_accuracy'])} | coverage: {percent(scores['coverage'])} | correct / all: {percent(scores['correct_command_fraction'])}")
 
 
-def _replay(recording, bundle, output, ui=False, realtime=False, speed=1.0):
+def _replay(recording, bundle, output, realtime=False, speed=1.0):
     if recording.subject_id != bundle.metadata.get("training_subject"):
         raise ValueError("Replay subject does not match this subject-specific model's training subject")
     context = {"format": "mi-bci-replay-context-v1", "model_version": bundle.version,
                "config": bundle.config.to_dict(), "subject_id": recording.subject_id,
                "session_id": recording.session_id, "timeline_sha256": _timeline_digest(recording)}
     source = ReplaySource(recording, chunk_samples=bundle.config.chunk_samples,
-                          realtime=realtime or ui, speed=speed, imagery_seconds=bundle.config.imagery_seconds)
-    result = {}
-    def task(observer=None, stop=None):
-        predictions, commands = run_session(source, bundle, output, observer, stop)
-        write_json(Path(output) / "replay_context.json", context)
-        report = evaluate(recording.trials, predictions, commands, sfreq=bundle.config.sfreq, imagery_seconds=bundle.config.imagery_seconds)
-        report["data_provenance"] = recording.metadata
-        report["mode"] = "synthetic_replay" if recording.metadata.get("synthetic") else "continuous_replay"
-        report["evaluation_role"] = "independent_E_session" if recording.session_id == "E" else "training_session_replay_not_independent"
-        report["session_status"] = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))["status"]
-        write_json(Path(output) / "evaluation.json", report)
-        result["report"] = report
-    if ui:
-        synthetic = recording.metadata.get("synthetic", False)
-        show_feedback(task, scope="合成数据回放 · 仅工程验证" if synthetic else "连续数据回放 · 非真实闭环实验")
-    else:
-        task()
-    if "report" in result:
-        _brief(result["report"])
-    return result.get("report")
-
-
-def cmd_demo(args):
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=False)
-    print("Creating synthetic T/E sessions. These scores are not human EEG results.", flush=True)
-    train_data = make_synthetic_recording(session_id="T", seed=args.seed)
-    test_data = make_synthetic_recording(session_id="E", seed=args.seed + 1000)
-    save_recording(output / "train.npz", train_data)
-    save_recording(output / "evaluation.npz", test_data)
-    print("Fitting CSP + shrinkage LDA with run-grouped validation...", flush=True)
-    bundle = train_recording(train_data, _config(args.config))
-    bundle.save(output / "model")
-    write_json(output / "training_report.json", bundle.report)
-    print(f"Frozen decision policy: {bundle.report['selected_policy']}", flush=True)
-    _replay(test_data, bundle, output / "session", args.ui, args.realtime, args.speed)
-    print(f"Demo saved: {output.resolve()}")
-
-
-def cmd_import(args):
-    recording = load_gdf(args.gdf, labels_path=args.labels, strict=not args.relaxed)
-    if Path(args.output).exists():
-        raise FileExistsError(f"Output already exists: {args.output}")
-    save_recording(args.output, recording)
-    print(json.dumps({"subject": recording.subject_id, "session": recording.session_id, "trials": len(recording.trials), "left": sum(t.original_class == 1 for t in recording.trials), "right": sum(t.original_class == 2 for t in recording.trials), "unknown": sum(t.original_class is None for t in recording.trials)}, indent=2))
+                          realtime=realtime, speed=speed, imagery_seconds=bundle.config.imagery_seconds)
+    predictions, commands = run_session(source, bundle, output)
+    write_json(Path(output) / "replay_context.json", context)
+    report = evaluate(recording.trials, predictions, commands, **_evaluation_parameters(bundle.config))
+    report["data_provenance"] = recording.metadata
+    report["mode"] = "continuous_replay"
+    report["evaluation_role"] = "independent_E_session" if recording.session_id == "E" else "training_session_replay_not_independent"
+    report["session_status"] = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))["status"]
+    write_json(Path(output) / "evaluation.json", report)
+    _brief(report)
+    return report
 
 
 def cmd_train(args):
     if Path(args.model).exists():
         raise FileExistsError(f"Model destination exists: {args.model}")
-    recording = _read(args.data)
-    config = (_config(args.config) if args.config else
-              Config.from_dict(recording.metadata["config"]) if "config" in recording.metadata else Config())
-    bundle = train_recording(recording, config)
+    recording = load_recording(args.data)
+    config = _config(args.config) if args.config else None
+    try:
+        bundle = train_recording(recording, config,
+                                 min_trials_per_class_per_run=args.min_trials_per_class_per_run,
+                                 max_class_ratio=args.max_class_ratio,
+                                 max_rejected_trial_fraction=args.max_rejected_trial_fraction,
+                                 max_rejected_window_fraction=args.max_rejected_window_fraction)
+    except CalibrationDataError as exc:
+        audit = Path(args.audit_output or (str(args.model) + ".audit.json"))
+        if audit.exists():
+            raise FileExistsError(f"Audit destination exists: {audit}; original error: {exc}") from exc
+        audit.parent.mkdir(parents=True, exist_ok=True)
+        write_json(audit, exc.report)
+        raise ValueError(f"{exc}; audit saved to {audit}") from exc
     bundle.save(args.model)
     print(f"Saved frozen model {bundle.version}: {Path(args.model).resolve()}")
     print(json.dumps(bundle.report["selected_policy"], indent=2))
@@ -2654,17 +3896,19 @@ def cmd_train(args):
 
 def cmd_replay(args):
     bundle = ModelBundle.load(args.model)
-    recording = _read(args.data, args.labels)
-    _replay(recording, bundle, args.output, args.ui, args.realtime, args.speed)
+    recording = load_recording(args.data)
+    _replay(recording, bundle, args.output, realtime=args.realtime, speed=args.speed)
 
 
 def cmd_evaluate(args):
-    recording = _read(args.data, args.labels)
+    if Path(args.output).exists():
+        raise FileExistsError(f"Output already exists: {args.output}")
+    recording = load_recording(args.data)
     context_path = Path(args.session) / "replay_context.json"
     context = json.loads(context_path.read_text(encoding="utf-8")) if context_path.exists() else None
     if context is not None and context.get("timeline_sha256") != _timeline_digest(recording):
         raise ValueError("Scoring recording differs from the replay signal or neutral trial timeline")
-    config = Config.from_dict(context["config"]) if context else None
+    config = Config.from_dict(context["config"]) if context else _recording_config(recording)
     predictions, commands = [], []
     with (Path(args.session) / "events.jsonl").open(encoding="utf-8") as stream:
         for line in stream:
@@ -2676,55 +3920,17 @@ def cmd_evaluate(args):
                 predictions.append(Prediction(**event))
             elif kind == "Command":
                 commands.append(Command(**event))
-    report = evaluate(recording.trials, predictions, commands, sfreq=recording.info.sfreq,
-                      imagery_seconds=config.imagery_seconds if config else 4.0)
+    report = evaluate(recording.trials, predictions, commands, **_evaluation_parameters(config))
     report["data_provenance"] = recording.metadata
     report["mode"] = "post_hoc_replay_scoring" if context else "post_hoc_scoring_without_replay_context"
     report["alignment_verified"] = context is not None
+    report["label_alignment_verified"] = context is not None
+    report["alignment_verification_scope"] = "Recording/phase identity only; physical cue alignment is not measured"
     manifest_path = Path(args.session) / "manifest.json"
     report["session_status"] = json.loads(manifest_path.read_text(encoding="utf-8")).get("status") if manifest_path.exists() else "unknown"
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     write_json(args.output, report)
     _brief(report)
-
-
-def cmd_batch(args):
-    data_dir = Path(args.data_dir)
-    labels_dir = Path(args.labels_dir) if args.labels_dir else data_dir
-    paths, missing = [], []
-    for subject in args.subjects:
-        pair = []
-        for session in ("T", "E"):
-            candidates = [data_dir / f"{subject}{session}{extension}" for extension in (".npz", ".gdf")]
-            found = next((p for p in candidates if p.exists()), None)
-            if found is None:
-                missing.append(f"{subject}{session}.npz or .gdf")
-            pair.append(found)
-        label = labels_dir / f"{subject}E.mat"
-        if pair[1] is not None and pair[1].suffix == ".gdf" and not label.exists():
-            missing.append(str(label))
-        paths.append((subject, pair, label))
-    if missing:
-        raise FileNotFoundError("Missing batch inputs: " + ", ".join(missing))
-    root = Path(args.output)
-    root.mkdir(parents=True, exist_ok=False)
-    subjects = []
-    for subject, (train_path, evaluation_path), label in paths:
-        print(f"Training and replaying {subject}...", flush=True)
-        training = _read(train_path)
-        testing = _read(evaluation_path, label if label.exists() else None)
-        if any(t.original_class is None for t in testing.trials):
-            raise ValueError(f"{subject}: independent E truth is required for batch scoring")
-        if training.subject_id != testing.subject_id or training.subject_id != subject or testing.session_id != "E":
-            raise ValueError("Batch subject/session pairing mismatch")
-        bundle = train_recording(training, _config(args.config))
-        bundle.save(root / subject / "model")
-        report = _replay(testing, bundle, root / subject / "session")
-        subjects.append({"subject": subject, **report["all"]})
-        write_json(root / "summary.json", {"status": "running", "subjects": subjects})
-    metrics = ("accuracy", "balanced_accuracy", "command_accuracy", "coverage", "correct_command_fraction")
-    means = {key: sum(s[key] for s in subjects if s[key] is not None) / sum(s[key] is not None for s in subjects) if any(s[key] is not None for s in subjects) else None for key in metrics}
-    write_json(root / "summary.json", {"status": "complete", "subjects": subjects, "macro_mean": means, "scope": "Each subject: T run-grouped selection then frozen E continuous replay"})
-    print(f"Batch summary: {(root / 'summary.json').resolve()}")
 
 
 def _lsl_description(header):
@@ -2818,6 +4024,8 @@ def _capture_context(args, config, source, mode, model_version=None):
     return {"format": "mi-bci-personal-capture-v1", "subject_id": args.subject,
             "session_id": "E" if mode == "live" else args.session_id,
             "mode": mode, "config": config.to_dict(), "model_version": model_version,
+            "application_version": __version__,
+            "prediction_timestamp_semantics": "last_actual_EEG_sample_in_complete_window",
             "eeg_name": args.eeg_name, "marker_name": args.marker_name,
             "reported_lsl_labels": list(getattr(source, "reported_labels", [])),
             "started_at_utc": datetime.now(timezone.utc).isoformat()}
@@ -2830,7 +4038,7 @@ def cmd_record(args):
     source = LiveSource(config, args.eeg_name, args.marker_name, config.reference, args.units)
     try:
         context = _capture_context(args, config, source, "calibration")
-        print("Connected. Click Start in the paradigm window. Acquisition saves automatically at SESSION_END.", flush=True)
+        print("Connected. Waiting for the external experiment markers. Acquisition saves automatically at SESSION_END; Ctrl+C stops early.", flush=True)
         summary = record_session(source, config, args.output,
                                  observer=lambda item: print(f"{item.kind}: {item.trial_id or ''}", flush=True)
                                  if isinstance(item, Marker) else None, context=context)
@@ -2846,6 +4054,46 @@ def cmd_import_session(args):
     save_recording(args.output, recording)
     print(f"Saved {Path(args.output).resolve()}: {recording.subject_id}/{recording.session_id}, "
           f"{len(recording.trials)} trials, {len(recording.run_starts)} runs")
+
+
+def _verify_live_output(directory, context, predictions, commands):
+    """Cross-check actual runtime and published output, not just a context label."""
+    directory = Path(directory)
+    summary = json.loads((directory / "runtime_summary.json").read_text(encoding="utf-8"))
+    if (summary.get("mode") != "live" or summary.get("model_version") != context["model_version"]
+            or summary.get("status") != "complete" or summary.get("session_end_observed") is not True
+            or summary.get("acquisition_thread_still_running") or summary.get("cleanup_errors")):
+        raise ValueError("Online scoring requires a completed live runtime with the same frozen model")
+    if (summary.get("predictions") != len(predictions)
+            or summary.get("commands") != sum(c.direction != "NO_COMMAND" for c in commands)):
+        raise ValueError("Runtime prediction/command counts disagree with event records")
+    for key in ("pending_acquisition_packets", "failed_to_retain_samples", "unwritten_accepted_samples"):
+        if summary.get(key) != 0:
+            raise ValueError("Online runtime reports unrecorded or unfinished data")
+    published = []
+    session_id, sequence = None, 0
+    with (directory / "results.jsonl").open(encoding="utf-8") as stream:
+        for line in stream:
+            row = json.loads(line)
+            if (row.get("schema") != SCHEMA or row.get("mode") != "live"
+                    or row.get("model_version") != context["model_version"]):
+                raise ValueError("Published results are not from this live model")
+            identity, number = row.get("session_id"), row.get("sequence")
+            if (not isinstance(identity, str) or not identity or (session_id is not None and identity != session_id)
+                    or isinstance(number, bool) or not isinstance(number, int) or number <= sequence):
+                raise ValueError("Published result identity/sequence is invalid")
+            session_id, sequence = identity, number
+            if row.get("type") == "Command":
+                published.append(row["payload"])
+    if not published or published != [asdict(command) for command in commands]:
+        raise ValueError("Published live commands and recorded commands do not match exactly")
+    for command in commands:
+        if command.direction in {"LEFT", "RIGHT"}:
+            if any(getattr(command, name) is None for name in
+                   ("emitted_at", "cue_to_output_seconds", "result_age_seconds")):
+                raise ValueError("Live direction commands require measured output times and result age")
+    return {"runtime_mode_verified": True, "published_commands_verified": True,
+            "result_session_id": session_id, "hardware_or_human_validation": "not_established_by_software_logs"}
 
 
 def cmd_evaluate_live(args):
@@ -2866,11 +4114,15 @@ def cmd_evaluate_live(args):
                 predictions.append(Prediction(**event))
             elif kind == "Command":
                 commands.append(Command(**event))
+    output_verification = _verify_live_output(args.session, context, predictions, commands)
     config = Config.from_dict(context["config"])
-    report = evaluate(recording.trials, predictions, commands, sfreq=config.sfreq, imagery_seconds=config.imagery_seconds)
+    report = evaluate(recording.trials, predictions, commands, **_evaluation_parameters(config))
     if report["stability"]["unknown_trial_predictions"] or report["stability"]["unknown_trial_direction_commands"]:
         raise ValueError("Predictions or commands reference trials outside this capture")
-    report.update(mode="personal_online_test", alignment_verified=True, model_version=context["model_version"],
+    report.update(mode="personal_online_test", alignment_verified=True, label_alignment_verified=True,
+                  alignment_verification_scope="Exact label/phase sequence only; physical cue alignment is not measured",
+                  model_version=context["model_version"],
+                  output_verification=output_verification,
                   subject_id=recording.subject_id, session_status="complete", data_provenance=recording.metadata)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     write_json(args.output, report)
@@ -2881,72 +4133,49 @@ def cmd_live(args):
     if Path(args.output).exists():
         raise FileExistsError(f"Output already exists: {args.output}")
     bundle = ModelBundle.load(args.model)
-    if bundle.metadata.get("synthetic"):
-        raise ValueError("Synthetic demonstration models cannot be used for a personal live experiment")
     if args.subject != bundle.metadata.get("training_subject"):
         raise ValueError("The live subject must match the model's calibration subject")
     source = LiveSource(bundle.config, args.eeg_name, args.marker_name, args.reference or bundle.config.reference, args.units)
     try:
         context = _capture_context(args, bundle.config, source, "live", bundle.version)
-        print("Connected. Start the independent test in the paradigm window.", flush=True)
-        def task(observer=None, stop=None):
-            run_session(source, bundle, args.output, observer, stop, context=context)
-        if args.ui:
-            show_feedback(task, title="MI · LSL 实时采集", scope=f"设备 EEG · {args.subject} · 独立在线测试")
-        else:
-            task()
+        print("Connected. Waiting for external test markers. Predictions and commands are saved to the session directory; Ctrl+C stops early.", flush=True)
+        run_session(source, bundle, args.output, context=context, result_stream_name=args.result_stream_name)
     finally:
         source.close()
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv:
-        app_data = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / ".local" / "share"))
-        run_name = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
-        output = app_data / "MI_BCI" / "runs" / run_name
-        argv = ["demo", "--ui", "--output", str(output)]
-    parser = argparse.ArgumentParser(prog="main.py", description="Causal cue-synchronous motor imagery research system")
+    parser = argparse.ArgumentParser(
+        prog="main.py", description="真实 EEG 运动想象命令行系统：LSL 原始数据采集与在线解码",
+        epilog="首次使用：inspect-lsl → configure-lsl → preflight → experiment + record → import-session → train。\n"
+               "在线测试：live --model <模型目录> --subject <受试者ID> --eeg-name <原始EEG流名> --output <新目录>。\n"
+               "experiment 提供终端提示、阶段标记（默认 MI_Markers）及独立标签日志；本程序不提供 GUI。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     commands = parser.add_subparsers(dest="command", required=True)
-    demo = commands.add_parser("demo", help="Generate synthetic T/E, train, replay, record and score")
-    demo.add_argument("--output", default="outputs/demo")
-    demo.add_argument("--seed", type=int, default=42)
-    demo.add_argument("--config")
-    demo.set_defaults(func=cmd_demo)
-    imp = commands.add_parser("import-gdf", help="Import complete BCI IV 2a timeline")
-    imp.add_argument("gdf")
-    imp.add_argument("--labels", help="Official classlabel MAT; attach before filtering")
-    imp.add_argument("--output", required=True)
-    imp.add_argument("--relaxed", action="store_true", help="Relax standard dataset counts, for fixtures only")
-    imp.set_defaults(func=cmd_import)
-    train = commands.add_parser("train", help="T-only run-grouped CSP/LDA fitting")
-    train.add_argument("data")
+    train = commands.add_parser("train", help="Fit personal calibration CSP/LDA with run-grouped validation")
+    train.add_argument("data", help="Personal calibration NPZ created by import-session")
     train.add_argument("--model", required=True)
-    train.add_argument("--config")
+    train.add_argument("--config", help="Override processing settings; defaults to the recorded acquisition configuration")
+    train.add_argument("--min-trials-per-class-per-run", type=int, default=10)
+    train.add_argument("--max-class-ratio", type=float, default=2.0)
+    train.add_argument("--max-rejected-trial-fraction", type=float, default=0.5)
+    train.add_argument("--max-rejected-window-fraction", type=float, default=0.5)
+    train.add_argument("--audit-output", help="Insufficient-data report; default <model>.audit.json")
     train.set_defaults(func=cmd_train)
-    replay = commands.add_parser("replay", help="Replay all trials with neutral markers")
-    replay.add_argument("data")
+    replay = commands.add_parser("replay", help="Replay personal recorded EEG with neutral markers")
+    replay.add_argument("data", help="Personal recording NPZ created by import-session")
     replay.add_argument("--model", required=True)
-    replay.add_argument("--labels")
     replay.add_argument("--output", required=True)
     replay.set_defaults(func=cmd_replay)
-    for command in (demo, replay):
-        command.add_argument("--ui", action="store_true", help="Show probability bars and command feedback; enables pacing")
-        command.add_argument("--realtime", action="store_true")
-        command.add_argument("--speed", type=float, default=1.0)
-    evaluation = commands.add_parser("evaluate", help="Score previously recorded predictions separately")
-    evaluation.add_argument("--data", required=True)
+    replay.add_argument("--realtime", action="store_true")
+    replay.add_argument("--speed", type=float, default=1.0)
+    evaluation = commands.add_parser("evaluate", help="Score personal replay predictions against the imported truth")
+    evaluation.add_argument("--data", required=True, help="Personal recording NPZ created by import-session")
     evaluation.add_argument("--session", required=True)
-    evaluation.add_argument("--labels")
     evaluation.add_argument("--output", required=True)
     evaluation.set_defaults(func=cmd_evaluate)
-    batch = commands.add_parser("batch", help="Run paired subject-specific T/E evaluations")
-    batch.add_argument("--data-dir", required=True)
-    batch.add_argument("--labels-dir")
-    batch.add_argument("--output", required=True)
-    batch.add_argument("--subjects", nargs="+", default=[f"A{i:02d}" for i in range(1, 10)])
-    batch.add_argument("--config")
-    batch.set_defaults(func=cmd_batch)
     inspect_lsl = commands.add_parser("inspect-lsl", help="List actual LSL stream names, sample rates, channels and units")
     inspect_lsl.add_argument("--timeout", type=float, default=3)
     inspect_lsl.set_defaults(func=cmd_inspect_lsl)
@@ -2959,6 +4188,21 @@ def main(argv=None):
     configure.add_argument("--units", choices=["V", "mV", "uV"], help="Verified input unit if missing from stream metadata")
     configure.add_argument("--output", required=True)
     configure.set_defaults(func=cmd_configure_lsl)
+    experiment = commands.add_parser("experiment", help="Run balanced terminal cues with neutral LSL markers and separate truth")
+    add_experiment_arguments(experiment)
+    experiment.set_defaults(func=cmd_experiment)
+    preflight = commands.add_parser("preflight", help="Measure real EEG timing and per-channel quality before collection")
+    preflight.add_argument("--config", required=True)
+    preflight.add_argument("--eeg-name", required=True)
+    preflight.add_argument("--duration", type=float, default=15.0)
+    preflight.add_argument("--thresholds", help="Explicit quality threshold JSON")
+    preflight.add_argument("--units", choices=["V", "mV", "uV"])
+    preflight.add_argument("--output", required=True)
+    preflight.set_defaults(func=cmd_preflight)
+    subscription = commands.add_parser("subscribe", help="Subscribe to expiring MI_Results commands; stdout JSONL")
+    subscription.add_argument("--stream-name", default="MI_Results")
+    subscription.add_argument("--timeout", type=float, default=0.5)
+    subscription.set_defaults(func=subscribe)
     record = commands.add_parser("record", help="Record personal calibration EEG and neutral cues without a model")
     record.add_argument("--config", required=True)
     record.add_argument("--subject", required=True)
@@ -2986,33 +4230,22 @@ def main(argv=None):
     live.add_argument("--reference", help="Defaults to the verified reference stored in the personal model")
     live.add_argument("--units", choices=["V", "mV", "uV"])
     live.add_argument("--output", required=True)
-    live.add_argument("--ui", action="store_true")
+    live.add_argument("--result-stream-name", default="MI_Results")
     live.set_defaults(func=cmd_live)
-    paradigm = commands.add_parser("paradigm", help="Present actual cues; emit only neutral LSL events")
-    paradigm.add_argument("--output", required=True, help="Separate cue truth JSONL")
-    paradigm.add_argument("--marker-name", default="MI_Markers")
-    paradigm.add_argument("--trials", type=int, default=20, help="Even number of trials PER run, balanced left/right")
-    paradigm.add_argument("--runs", type=int, default=1)
-    paradigm.add_argument("--run-rest", type=float, default=15, help="Seconds of rest between runs")
-    paradigm.add_argument("--seed", type=int, help="Optional reproducible randomization; otherwise fresh order")
-    paradigm_config = paradigm.add_mutually_exclusive_group()
-    paradigm_config.add_argument("--config", help="Use the same device config as calibration capture")
-    paradigm_config.add_argument("--model", help="Use the frozen model's timing for an online test")
-    def paradigm_run(args):
-        config = ModelBundle.load(args.model).config if args.model else _config(args.config)
-        run_paradigm(args.output, args.marker_name, args.trials, args.seed, args.runs, config, args.run_rest)
-    paradigm.set_defaults(func=paradigm_run)
+    if not argv:
+        parser.print_help()
+        return 0
     args = parser.parse_args(argv)
     try:
-        args.func(args)
+        result = args.func(args)
     except KeyboardInterrupt:
         print("Stopped; session records were finalized.", file=sys.stderr)
         return 130
     except ImportError as exc:
-        parser.exit(1, f"Missing dependency: {exc}. Install with python -m pip install -e .[live]\n")
+        parser.exit(1, f"Missing dependency: {exc}. Install with python -m pip install numpy scipy scikit-learn mne joblib pylsl\n")
     except (ValueError, OSError, RuntimeError) as exc:
         parser.exit(1, f"Error: {exc}\n")
-    return 0
+    return result if isinstance(result, int) else 0
 
 
 if __name__ == "__main__":
