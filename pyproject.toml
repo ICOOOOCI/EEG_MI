@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eeg-mi"
+version = "0.6.0"
+description = "Layered EEG motor-imagery acquisition and decoding application"
+requires-python = ">=3.10"
+dependencies = [
+  "joblib",
+  "mne",
+  "numpy",
+  "scikit-learn",
+  "scipy",
+]
+
+[project.optional-dependencies]
+ml = ["pyriemann", "torch"]
+gui = ["pylsl", "PyQt6"]
+
+[project.scripts]
+eeg-mi = "eeg_mi.cli:main"
+eeg-mi-gui = "eeg_mi.gui:launch"
+
+[tool.setuptools.packages.find]
+include = ["eeg_mi*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

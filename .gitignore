@@ -9,3 +9,9 @@ venv/
 
 # Local EEG dataset
 BCICIV_2a_gdf/
+
+# Local offline benchmark reports, predictions and fitted public-data models
+benchmark_runs/
+
+# Personal EEG captures
+recordings/
